@@ -20,6 +20,7 @@ Phases:
   14  CI/CD Exposure  Jenkins · Spring Actuator · phpinfo · Laravel Telescope · Adminer
   15  Next.js Probe   BUILD_ID → /_next/data/ JSON endpoint harvest
   16  Exploit Mapper  CVEs detectados → tools/cve/<CVE-ID>/ (exploits locais)
+  17  Email Score     SPF · DMARC · DKIM · CAA → 0–10 score + grade
 
 Input (auto-detected from --recon-dir):
   httpx/httpx_results.jsonl    → tech + status codes (for phases 4, 9, 15)
@@ -140,6 +141,12 @@ INFO_DISCLOSURE_HEADERS = [
 ]
 
 CORS_HEADERS = ["Access-Control-Allow-Origin", "Access-Control-Allow-Credentials"]
+
+# ─── Print Severity Threshold ─────────────────────────────────────────────────
+# Findings below this rank go to JSONL only (not printed inline during scan).
+# Set via --min-print-sev; defaults to "medium" to suppress low/info noise.
+_SEV_RANK: dict = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+_print_rank: list = [2]  # mutable so main() can update after arg parsing
 
 # ─── CSP Bypass Database ──────────────────────────────────────────────────────
 
@@ -344,6 +351,14 @@ _CICD_BODY_SIGNATURES = {
     "/kibana/":         ["kibana"],
     "/app/kibana":      ["kibana"],
     "/minio/":          ["minio", "buckets"],
+    "/grafana/":     ["grafana", "datasource", "dashboard"],
+    "/grafana/login":["grafana", "sign in"],
+    "/app/grafana":  ["grafana"],
+    "/portainer/":   ["portainer", "environment", "container"],
+    "/mongo-express/":["mongo express", "mongodb", "collection"],
+    "/redis-insight/":["redis insight", "redis", "key"],
+    "/jupyter/":     ["jupyter", "notebook", "kernel"],
+    "/jupyter/lab":  ["jupyter", "lab"],
 }
 
 CICD_PATHS = [
@@ -409,6 +424,30 @@ CICD_PATHS = [
     # Kubernetes API (sometimes exposed on 80/443)
     ("/api/v1/namespaces",               "Kubernetes API",         "critical"),
     ("/readyz",                          "K8s readiness probe",    "medium"),
+    # Grafana
+    ("/grafana/",                        "Grafana Dashboard",        "high"),
+    ("/grafana/login",                   "Grafana Login",            "medium"),
+    ("/app/grafana",                     "Grafana App",              "high"),
+    # Portainer
+    ("/portainer/",                      "Portainer Docker UI",      "critical"),
+    # Consul Web UI
+    ("/consul/ui/",                      "Consul Web UI",            "high"),
+    # Mongo Express
+    ("/mongo-express/",                  "Mongo Express DB UI",      "critical"),
+    # RedisInsight
+    ("/redis-insight/",                  "RedisInsight UI",          "high"),
+    # Jupyter
+    ("/jupyter/",                        "Jupyter Notebook",         "critical"),
+    ("/jupyter/lab",                     "JupyterLab",               "critical"),
+    # Strapi / generic CMS admin
+    ("/admin/auth/login",                "CMS Admin login",          "medium"),
+    # Sensitive config/env files
+    ("/.env.production",                 ".env.production",          "critical"),
+    ("/.env.prod",                       ".env.prod",                "critical"),
+    ("/config/database.yml",             "Rails database config",    "critical"),
+    # Dependency manifests (low — reveals tech stack)
+    ("/package.json",                    "package.json exposed",     "low"),
+    ("/composer.json",                   "composer.json exposed",    "low"),
 ]
 
 # ─── DNS DKIM Selectors ───────────────────────────────────────────────────────
@@ -811,14 +850,15 @@ def _write_jsonl(path: Path, records: list):
     path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
 
 def _add_finding(findings: list, phase: str, severity: str, ftype: str,
-                 host: str, title: str, detail: str = "", evidence=None):
+                 host: str, title: str, detail: str = "", evidence=None, _quiet: bool = False):
     f = {
         "phase": phase, "severity": severity, "type": ftype,
         "host": host, "title": title, "detail": detail,
         "evidence": evidence,
     }
     findings.append(f)
-    finding_line(f)
+    if not _quiet and _SEV_RANK.get(severity, 4) <= _print_rank[0]:
+        finding_line(f)
     return f
 
 # ─── Phase 0 · Header Analysis ────────────────────────────────────────────────
@@ -999,13 +1039,22 @@ def phase_headers(live_hosts: list, outdir: Path, session, findings: list, threa
                                      evidence=val)
                     hf.append(f)
 
-        # Info disclosure headers
+        # Info disclosure headers — batch into ONE line per host to reduce noise
+        disc_found = []
         for h in INFO_DISCLOSURE_HEADERS:
             val = hdrs.get(h.lower())
             if val:
+                disc_found.append((h, val))
                 _add_finding(findings, "header", "low", "info_disclosure",
                              host, f"Server info disclosure via {h}: {val[:80]}",
-                             evidence=f"{h}: {val}")
+                             evidence=f"{h}: {val}", _quiet=True)
+        if disc_found:
+            disc_str = "  ".join(f"{h}: {v[:25]}" for h, v in disc_found[:4])
+            if len(disc_found) > 4:
+                disc_str += f"  …+{len(disc_found)-4}"
+            with _lock:
+                sev_col = SEV_COLOR.get("low", dim)
+                print(f"  {sev_col('[LOW ]')} {cyan(host)} → {disc_str}")
 
         # CORS — passive (baseline headers) + active probe (reflected origin check)
         _analyze_cors(hdrs, host, findings)
@@ -1033,6 +1082,49 @@ def phase_headers(live_hosts: list, outdir: Path, session, findings: list, threa
                 _add_finding(findings, "cookie", "medium", "cookie_no_samesite",
                              host, f"Cookie '{name_part}' missing SameSite attribute",
                              evidence=cookie_str[:200])
+
+        # HSTS preload eligibility check
+        hsts_val = hdrs.get("strict-transport-security", "")
+        if hsts_val and "max-age" in hsts_val.lower() and "preload" not in hsts_val.lower():
+            _add_finding(findings, "header", "low", "hsts_no_preload",
+                         host, "HSTS missing 'preload' — not eligible for browser preload lists",
+                         detail="Preload requires: max-age≥31536000; includeSubDomains; preload",
+                         evidence=hsts_val)
+
+        # CSP-Report-Only detection
+        csp_ro = hdrs.get("content-security-policy-report-only", "")
+        if csp_ro and not has_csp:
+            _add_finding(findings, "header", "medium", "csp_report_only",
+                         host, "CSP-Report-Only present but no enforced CSP — XSS not blocked",
+                         detail="Content-Security-Policy-Report-Only only reports; does not prevent inline XSS",
+                         evidence=csp_ro[:200])
+        elif csp_ro and has_csp:
+            _add_finding(findings, "header", "info", "csp_report_only_alongside",
+                         host, "CSP-Report-Only alongside enforced CSP — new policy being tested",
+                         evidence=csp_ro[:100], _quiet=True)
+
+        # Alt-Svc / HTTP2 / HTTP3 detection (info-only, suppressed by default)
+        alt_svc = hdrs.get("alt-svc", "")
+        if alt_svc:
+            protos = []
+            if "h3" in alt_svc.lower():
+                protos.append("HTTP/3")
+            if "h2" in alt_svc and "h2c" not in alt_svc:
+                protos.append("HTTP/2")
+            if protos:
+                _add_finding(findings, "header", "info", "modern_protocol_advertised",
+                             host, f"Alt-Svc advertises {', '.join(protos)}",
+                             evidence=alt_svc[:200], _quiet=True)
+
+        # Rate-limit headers presence (info — note what is/isn't in place)
+        rl_headers = ["retry-after", "x-ratelimit-limit", "x-ratelimit-remaining",
+                      "ratelimit-limit", "x-rate-limit-limit", "x-rate-limit-remaining"]
+        rl_found = [h for h in rl_headers if h in hdrs]
+        if rl_found:
+            _add_finding(findings, "header", "info", "rate_limit_headers",
+                         host, f"Rate-limit headers detected: {', '.join(rl_found)}",
+                         evidence=", ".join(f"{h}: {hdrs[h][:30]}" for h in rl_found),
+                         _quiet=True)
 
         host_findings[host] = hf
 
@@ -1148,6 +1240,50 @@ def phase_dns(domain: str, outdir: Path, findings: list):
     dns_data["mx"] = mx or ""
     if not mx:
         info(f"  No MX record (may be intentional)")
+
+    # CNAME → subdomain takeover scan
+    _TAKEOVER_SIGS = {
+        "github.io":          ("GitHub Pages",     "high"),
+        "herokuapp.com":      ("Heroku",           "high"),
+        "azurewebsites.net":  ("Azure App Service","high"),
+        "s3.amazonaws.com":   ("AWS S3",           "high"),
+        "s3-website":         ("AWS S3 Website",   "high"),
+        "bitbucket.io":       ("Bitbucket Pages",  "medium"),
+        "netlify.app":        ("Netlify",          "medium"),
+        "netlify.com":        ("Netlify",          "medium"),
+        "ghost.io":           ("Ghost",            "medium"),
+        "surge.sh":           ("Surge.sh",         "medium"),
+        "readme.io":          ("ReadMe",           "medium"),
+        "zendesk.com":        ("Zendesk",          "medium"),
+        "fastly.net":         ("Fastly CDN",       "medium"),
+        "unbouncepages.com":  ("Unbounce",         "medium"),
+        "myshopify.com":      ("Shopify",          "medium"),
+    }
+    _TAKEOVER_SUBS = ["www", "mail", "blog", "shop", "status", "support",
+                      "help", "docs", "dev", "api", "staging", "cdn",
+                      "static", "assets", "app", "old", "new", "test"]
+    info("  CNAME → takeover candidates …")
+    takeover_hits = []
+    for sub in _TAKEOVER_SUBS:
+        fqdn = f"{sub}.{domain}"
+        cname_raw = _dig([fqdn, "CNAME"])
+        if not cname_raw or "NXDOMAIN" in cname_raw:
+            continue
+        cname_target = cname_raw.strip().rstrip(".").lower()
+        for svc_domain, (svc_name, sev) in _TAKEOVER_SIGS.items():
+            if svc_domain in cname_target:
+                takeover_hits.append({"sub": fqdn, "cname": cname_target, "service": svc_name})
+                _add_finding(findings, "dns", sev, "cname_takeover_candidate",
+                             fqdn,
+                             f"CNAME → {svc_name} ({cname_target}) — verify if claimed",
+                             detail=f"dig CNAME {fqdn} → {cname_target}. "
+                                    f"Unclaimed pages/apps at this service → subdomain takeover.",
+                             evidence={"subdomain": fqdn, "cname": cname_target, "service": svc_name})
+    if takeover_hits:
+        ok(f"  {len(takeover_hits)} CNAME takeover candidate(s) found:")
+        for h in takeover_hits:
+            with _lock: print(f"    {yellow(h['sub'])} → {dim(h['cname'])}")
+    dns_data["cname_takeover_candidates"] = takeover_hits
 
     (out_dir / "dns_data.json").write_text(json.dumps(dns_data, indent=2))
     ok(f"  DNS analysis done for {domain}")
@@ -1317,9 +1453,6 @@ def phase_favicon(live_hosts: list, outdir: Path, session, findings: list, threa
                              host, f"Favicon hash matches {product} (hash={h})",
                              detail=f"MurmurHash3={h} MD5={md5}",
                              evidence={"hash": h, "md5": md5, "product": product})
-            else:
-                with _lock:
-                    print(f"  {dim('[ICON]')} {host}{path} → hash={h} md5={md5[:8]}… (unknown)")
             # Save favicon for manual review
             ico_path = out_dir / f"{host.replace('://', '_').replace('/', '_')}{path.replace('/','_')}"
             try:
@@ -1344,7 +1477,7 @@ def phase_content_recon(live_hosts: list, outdir: Path, session, findings: list,
 
     def _probe_host(host):
         host = host.rstrip("/")
-        result = {"disallowed": [], "sitemap_urls": [], "wellknown": []}
+        result = {"disallowed": [], "sitemap_urls": [], "wellknown": [], "manifests": []}
 
         # robots.txt
         r = _safe_get(session, host + "/robots.txt", timeout=10)
@@ -1373,9 +1506,14 @@ def phase_content_recon(live_hosts: list, outdir: Path, session, findings: list,
 
         # .well-known
         for wk in ("/.well-known/security.txt", "/security.txt", "/.well-known/change-password"):
-            r = _safe_get(session, host + wk.lstrip("/"), timeout=8)
+            r = _safe_get(session, host + wk, timeout=8)
             if r and r.status_code == 200:
                 result["wellknown"].append({"path": wk, "body": r.text[:500]})
+        # Dependency manifests
+        for mf in ("/package.json", "/composer.json"):
+            r = _safe_get(session, host + mf, timeout=6)
+            if r and r.status_code == 200 and r.text.lstrip().startswith("{"):
+                result["manifests"].append({"path": mf, "body": r.text[:800]})
         return host, result
 
     with ThreadPoolExecutor(max_workers=threads) as ex:
@@ -1395,6 +1533,17 @@ def phase_content_recon(live_hosts: list, outdir: Path, session, findings: list,
                 ok(f"  {host} → sitemap: {len(result['sitemap_urls'])} URLs")
             for wk in result.get("wellknown", []):
                 ok(f"  {host} → {wk['path']} (200 OK)")
+            for mf in result.get("manifests", []):
+                try:
+                    data = json.loads(mf["body"])
+                    name = data.get("name", "")
+                    version = data.get("version", "")
+                    detail = f"name={name} version={version}" if name else ""
+                except Exception:
+                    detail = ""
+                _add_finding(findings, "content", "low", "manifest_exposed",
+                             host, f"Dependency manifest exposed: {mf['path']}",
+                             detail=detail, evidence=mf["path"])
 
     (out_dir / "content.json").write_text(json.dumps(all_paths, indent=2))
 
@@ -1503,7 +1652,20 @@ def phase_tls(live_hosts: list, outdir: Path, findings: list, threads: int = 20)
         for typ, val in cert.get("subjectAltName", []):
             if typ == "DNS":
                 sans.append(val)
-        return host, {"hostname": hostname, "port": port, "san": sans, "cert": cert}
+        # Certificate expiry
+        not_after_str = cert.get("notAfter", "")
+        days_left = None
+        if not_after_str:
+            try:
+                import datetime as _dt
+                not_after = _dt.datetime.strptime(not_after_str, "%b %d %H:%M:%S %Y %Z")
+                days_left = (not_after - _dt.datetime.utcnow()).days
+            except Exception:
+                pass
+        return host, {
+            "hostname": hostname, "port": port, "san": sans, "cert": cert,
+            "not_after": not_after_str, "days_left": days_left,
+        }
 
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futs = {ex.submit(_check_host, h): h for h in https_hosts}
@@ -1512,12 +1674,31 @@ def phase_tls(live_hosts: list, outdir: Path, findings: list, threads: int = 20)
             if not data:
                 continue
             all_sans[host] = data
+            # Certificate expiry finding
+            days_left = data.get("days_left")
+            not_after = data.get("not_after", "")
+            if days_left is not None:
+                if days_left < 0:
+                    _add_finding(findings, "tls", "critical", "tls_cert_expired",
+                                 host, f"TLS certificate EXPIRED {abs(days_left)} days ago",
+                                 evidence=not_after)
+                elif days_left < 14:
+                    _add_finding(findings, "tls", "high", "tls_cert_expiring",
+                                 host, f"TLS certificate expires in {days_left} days",
+                                 evidence=not_after)
+                elif days_left < 30:
+                    _add_finding(findings, "tls", "medium", "tls_cert_expiring",
+                                 host, f"TLS certificate expires in {days_left} days",
+                                 evidence=not_after)
             sans = data["san"]
             if sans:
                 ok(f"  {host} → {len(sans)} SAN entries")
-                for san in sans[:5]:
-                    with _lock: print(f"    {dim(san)}")
+                for i, san in enumerate(sans):
                     domain_to_hosts.setdefault(san, []).append(host)
+                    if i < 5:
+                        with _lock: print(f"    {dim(san)}")
+                if len(sans) > 5:
+                    with _lock: print(f"    {dim(f'… {len(sans)-5} more')}")
 
     # Collect unique new domains from SANs
     known_domains = set()
@@ -1888,7 +2069,7 @@ def phase_cache_probe(live_hosts: list, outdir: Path, session, findings: list, t
                                  detail=f"cache-control={r['cache_control']}",
                                  evidence=r)
 
-    (out_dir / "cache_probe.json").write_text(json.dumps(results, indent=2))
+    (out_dir / "cache_results.json").write_text(json.dumps(results, indent=2))
     ok(f"  Cache probe done — {len(results)} potential unkeyed headers")
 
 # ─── Phase 13 · WebSocket Discovery ──────────────────────────────────────────
@@ -2204,6 +2385,76 @@ def phase_exploit_mapper(findings: list, outdir: Path):
         info(f"  No local exploits matched {len(cve_ids)} detected CVEs")
         info(f"  Checked: {', '.join(missing)}{'…' if len(cve_ids) > 8 else ''}")
 
+# ─── Phase 17 · Email Security Score ─────────────────────────────────────────
+
+def phase_email_security(domain: str, outdir: Path, findings: list):
+    """Consolidate Phase 3 DNS findings into a 0–10 email security score."""
+    phase_header("17", f"Email Security Score — {domain}")
+
+    dns_f = [f for f in findings if f.get("phase") == "dns"]
+
+    def _has(ftype):
+        return any(f.get("type") == ftype for f in dns_f)
+
+    score = 10
+    rows: list = []
+
+    # SPF
+    if _has("no_spf"):
+        score -= 3; rows.append(("SPF",   "MISSING",           "critical"))
+    elif _has("spf_plus_all"):
+        score -= 3; rows.append(("SPF",   "+all (useless)",    "critical"))
+    elif _has("spf_neutral"):
+        score -= 1; rows.append(("SPF",   "?all (neutral)",    "medium"))
+    else:
+        rows.append(("SPF",   "OK",                "ok"))
+
+    # DMARC
+    if _has("no_dmarc"):
+        score -= 4; rows.append(("DMARC", "MISSING",           "critical"))
+    elif _has("dmarc_policy_none"):
+        score -= 2; rows.append(("DMARC", "p=none (report)",   "medium"))
+    else:
+        rows.append(("DMARC", "OK",                "ok"))
+
+    # DKIM
+    if _has("no_dkim"):
+        score -= 2; rows.append(("DKIM",  "not detected",      "low"))
+    else:
+        rows.append(("DKIM",  "OK",                "ok"))
+
+    # CAA
+    if _has("no_caa"):
+        score -= 1; rows.append(("CAA",   "MISSING",           "low"))
+    else:
+        rows.append(("CAA",   "OK",                "ok"))
+
+    score = max(0, score)
+    grade = "F" if score < 4 else ("D" if score < 5 else ("C" if score < 7 else ("B" if score < 9 else "A")))
+    sev   = "critical" if score < 4 else ("high" if score < 6 else ("medium" if score < 8 else "low"))
+
+    print(f"\n  {bold('Email Security Score:')} {bold(str(score))}/10  (Grade {bold(grade)})\n")
+    for (name, status, sl) in rows:
+        if sl == "ok":
+            icon, col_fn = "✓", lambda t: t
+        elif sl == "critical":
+            icon, col_fn = "✗", red
+        else:
+            icon, col_fn = "!", yellow
+        print(f"    {col_fn(icon)}  {name:<8}  {col_fn(status)}")
+    print()
+
+    _add_finding(findings, "email_security", sev, "email_security_score",
+                 domain, f"Email security score: {score}/10 (Grade {grade})",
+                 detail=" | ".join(f"{n}: {s}" for n, s, _ in rows))
+
+    out_dir = outdir / "email_security"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "email_score.json").write_text(json.dumps({
+        "domain": domain, "score": score, "grade": grade,
+        "checks": [{"check": n, "status": s, "severity": sl} for n, s, sl in rows],
+    }, indent=2))
+
 # ─── Report ───────────────────────────────────────────────────────────────────
 
 def write_report(base: Path, findings: list, target: str, phases_run: list):
@@ -2299,6 +2550,10 @@ def build_parser():
     p.add_argument("--skip-cicd",     action="store_true", help="Skip phase 14 (CI/CD)")
     p.add_argument("--skip-nextjs",   action="store_true", help="Skip phase 15 (Next.js probe)")
     p.add_argument("--skip-exploits", action="store_true", help="Skip phase 16 (exploit mapper — tools/cve/ lookup)")
+    p.add_argument("--skip-email-score", action="store_true", help="Skip phase 17 (email security score)")
+    p.add_argument("--min-print-sev", default="medium",
+                   choices=["critical", "high", "medium", "low", "info"], metavar="SEV",
+                   help="Minimum severity printed inline during scan (default: medium). low/info always saved to JSONL.")
     return p
 
 def _banner():
@@ -2314,6 +2569,8 @@ def main():
 
     parser = build_parser()
     args = parser.parse_args()
+
+    _print_rank[0] = _SEV_RANK.get(args.min_print_sev, 2)
 
     if not HAS_REQUESTS:
         err("requests not installed — pip install requests")
@@ -2354,7 +2611,6 @@ def main():
         for attr, paths in candidates.items():
             for p in paths:
                 if p.exists():
-                    locals()[attr]  # just to reference — see below
                     if attr == "httpx_jsonl":   httpx_jsonl = p
                     elif attr == "httpx_live":  httpx_live = p
                     elif attr == "ips_file":    ips_file = p
@@ -2487,6 +2743,14 @@ def main():
     if not args.skip_exploits:
         phase_exploit_mapper(findings, base)
         phases_run.append(16)
+
+    # ── Phase 17: Email Security Score ──────────────────────────────────────
+    if not args.skip_email_score:
+        if domain:
+            phase_email_security(domain, base, findings)
+            phases_run.append(17)
+        else:
+            warn("  --domain not set, skipping email security score (pass --domain example.com)")
 
     # ── Save findings ────────────────────────────────────────────────────────
     findings_path = base / "findings.jsonl"

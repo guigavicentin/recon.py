@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-secret-scan.py — JavaScript secret & endpoint scanner  v2.0
+secret-scan.py — JavaScript secret & endpoint scanner  v2.1
 
 Phases:
   0  Port Discovery   nmap on IPs → find hidden HTTP/HTTPS services
@@ -8,7 +8,7 @@ Phases:
                       (Playwright captures JS + .map files in a single browser pass)
   2  JS Download      concurrent download of static JS
   3  Source Maps      decompile .map → original source (only for non-Playwright JS)
-  4  Secret Scan      46 built-in patterns + trufflehog/gitleaks if available
+  4  Secret Scan      66 built-in patterns + trufflehog/gitleaks if available
   4b Key Validation   live-test discovered keys against real APIs
   5  Endpoint Scan    API paths, hardcoded URLs, internal params
 
@@ -352,6 +352,29 @@ SECRET_PATTERNS = [
     {"id": "planetscale_token",     "sev": "critical",
      "re": r"pscale_tkn_[A-Za-z0-9_]{32,}",
      "label": "PlanetScale Service Token"},
+    # ── Database-as-a-Service (extended) ──────────────────────────────────────
+    {"id": "neon_token",            "sev": "critical",
+     "re": r"neon_[A-Za-z0-9_-]{40,}",
+     "label": "Neon Database Access Token"},
+    # ── Auth / Identity ────────────────────────────────────────────────────────
+    {"id": "clerk_secret_key",      "sev": "critical",
+     "re": r"sk_live_[A-Za-z0-9]{48,}",
+     "label": "Clerk Secret Key (LIVE)"},
+    {"id": "okta_ssws_token",       "sev": "critical",
+     "re": r"\bSSWS [A-Za-z0-9_-]{40,}",
+     "label": "Okta SSWS API Token"},
+    # ── Email / Transactional ─────────────────────────────────────────────────
+    {"id": "brevo_api_key",         "sev": "high",
+     "re": r"xkeysib-[a-f0-9]{64}-[A-Za-z0-9_]{1,25}",
+     "label": "Brevo (Sendinblue) API Key"},
+    {"id": "resend_api_key",        "sev": "high",
+     "re": r"\bre_[A-Za-z0-9_-]{32,60}\b",
+     "label": "Resend.com API Key"},
+    # ── Package registry ──────────────────────────────────────────────────────
+    {"id": "npmrc_token",           "sev": "high",
+     "re": r"//registry\.npmjs\.org/:_authToken=(npm_[A-Za-z0-9]{36})",
+     "group": 1,
+     "label": "npmrc Auth Token"},
 ]
 
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -829,6 +852,10 @@ ENDPOINT_PATTERNS = [
     r"""['"` ](/(?:api|v[0-9]+|admin|internal|debug|test|dev|beta|graphql|rest|service|backend|auth|oauth|token|login|logout|user|account|payment|webhook|upload|download|export|import|report|analytics|config|settings|manage|dashboard)[^\s'"`<>]{0,150})['"` ]""",
     r"""['"` ](/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*/?(?:\?[^\s'"`<>]{0,100})?)['"` ]""",
     r"""['"` ](https?://(?!(?:www\.)?(?:google|facebook|twitter|cdn|fonts|jquery|bootstrap|cloudflare|unpkg|jsdelivr))[a-zA-Z0-9._-]{4,}/[^\s'"`<>]{5,100})['"` ]""",
+    # Base URL / API base assignments
+    r"""(?:baseURL|BASE_URL|api_url|API_URL|apiUrl|base_url|API_BASE|api_base|baseUrl)\s*[=:]\s*['"`]([^'"`\s]{8,120})['"`]""",
+    r"""window\.(?:API_URL|BASE_URL|apiUrl|baseUrl)\s*=\s*['"`]([^'"`\s]{8,120})['"`]""",
+    r"""['"](?:baseURL|base_url|apiUrl|api_url|endpoint|base_endpoint)['"]\s*:\s*['"`]([^'"`\s]{8,120})['"`]""",
 ]
 
 COMMON_JS_PATHS = [
@@ -1376,7 +1403,7 @@ def _scan_text(text, label, sev_filter):
                 if re.search(r':/+(?:[^@]+@)?(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?/',
                              value, re.I):
                     sev = "high"
-            out.append({
+            entry = {
                 "pattern":  pat["id"],
                 "label":    pat["label"],
                 "severity": sev,
@@ -1385,7 +1412,24 @@ def _scan_text(text, label, sev_filter):
                 "context":  ctx,
                 "source":   label,
                 "validated": None,
-            })
+            }
+            # JWT: decode header + payload inline to expose alg and key claims
+            if pat["id"] in ("jwt_token", "supabase_key"):
+                try:
+                    parts = value.split(".")
+                    if len(parts) == 3:
+                        def _b64d(s):
+                            s += "=" * (-len(s) % 4)
+                            return json.loads(base64.urlsafe_b64decode(s).decode())
+                        hdr = _b64d(parts[0])
+                        pay = _b64d(parts[1])
+                        alg = hdr.get("alg", "?")
+                        claims = {k: pay[k] for k in ("sub", "iss", "exp", "aud", "role", "email") if k in pay}
+                        entry["jwt_info"] = {"alg": alg, "claims": claims}
+                        entry["context"] = f"alg={alg} " + " ".join(f"{k}={v}" for k, v in list(claims.items())[:3])
+                except Exception:
+                    pass
+            out.append(entry)
     return out
 
 def _dedup(findings):
@@ -1469,6 +1513,25 @@ def scan_secrets(url_map, sourcemap_files, findings_dir, sev_filter, threads):
     with out_jsonl.open("w") as fh:
         for f in sorted(deduped, key=lambda x: SEV_ORDER.get(x["severity"], 9)):
             fh.write(json.dumps(f, ensure_ascii=False) + "\n")
+
+    # Write secrets_by_type.txt — grouped summary per pattern category
+    by_type: dict = {}
+    for f in deduped:
+        by_type.setdefault(f["label"], []).append(f)
+    type_lines = ["SECRET SCAN SUMMARY BY TYPE", "=" * 50, ""]
+    for lbl in sorted(by_type, key=lambda l: SEV_ORDER.get(by_type[l][0]["severity"], 9)):
+        entries_t = by_type[lbl]
+        sev_t = entries_t[0]["severity"]
+        type_lines.append(f"[{sev_t.upper():<8}] {lbl} ({len(entries_t)})")
+        for fe in entries_t[:3]:
+            masked = fe["value"][:4] + "…" + fe["value"][-4:] if len(fe["value"]) > 12 else fe["value"]
+            src = str(fe["source"])[:50]
+            type_lines.append(f"  {masked:<30}  ← {src}")
+        if len(entries_t) > 3:
+            type_lines.append(f"  … and {len(entries_t) - 3} more")
+        type_lines.append("")
+    (findings_dir / "secrets_by_type.txt").write_text("\n".join(type_lines))
+    ok(f"  secrets_by_type.txt written ({len(by_type)} types)")
 
     # Optional extra scanners
     for tool, cmd_fn in [
@@ -1914,6 +1977,28 @@ def write_report(base, findings, endpoints, url_map, sourcemap_files, extra_serv
                     f"- Context: `{f['context'][:120]}`",
                     "",
                 ]
+
+    # Secrets grouped by source host
+    if findings:
+        by_src: dict = {}
+        for f in findings:
+            src = str(f.get("source", "unknown"))
+            try:
+                netloc = urlparse(src).netloc
+                h = netloc if netloc else src.split("/")[0]
+            except Exception:
+                h = src[:40]
+            by_src.setdefault(h, []).append(f)
+        if len(by_src) > 1:
+            lines += ["", "## Secrets by Source Host", ""]
+            for h_src in sorted(by_src):
+                hf = by_src[h_src]
+                lines.append(f"### {h_src} ({len(hf)})")
+                for f in sorted(hf, key=lambda x: SEV_ORDER.get(x["severity"], 9)):
+                    v = f.get("validated") or {}
+                    status = " ✓" if v.get("valid") is True else ""
+                    lines.append(f"- [{f['severity'].upper()}] {f['label']}{status}: `{mask(f['value'])}`")
+                lines.append("")
 
     if endpoints:
         # Group by domain for report
