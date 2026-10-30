@@ -1195,7 +1195,7 @@ def _enum_subcat(domain: str, outdir: Path):
     out = outdir / "raw_subcat.txt"
     subcat_path = Path("/home/guilherme/kali/subcat/subcat/subcat.py")
     if not subcat_path.exists():
-        warn("  subcat not found  (expected /home/guilherme/kali/subcat/subcat.py)")
+        warn("  subcat not found  (expected /home/guilherme/kali/subcat/subcat/subcat.py)")
         return
     info("  subcat ...")
     rc, stdout, stderr = run(
@@ -1897,10 +1897,14 @@ def _collect_paramspider(domain: str, outdir: Path, proxy_env=None):
         return
     info("  paramspider ...")
     rc, stdout, _ = run(
-        ["paramspider", "-d", domain],
+        ["paramspider", "-d", domain, "--output", str(out)],
         env_extra=proxy_env, timeout=600,
     )
-    # paramspider writes to results/<domain>.txt regardless of stdout
+    # paramspider writes to --output path; older versions fall back to results/<domain>.txt
+    if out.exists() and out.stat().st_size > 0:
+        ok(f"  paramspider: {count_lines(out)}")
+        return
+    # older paramspider ignores --output and writes relative to CWD
     default_out = Path(f"results/{domain}.txt")
     if default_out.exists() and default_out.stat().st_size > 0:
         import shutil; shutil.copy(default_out, out)
@@ -2056,6 +2060,204 @@ def phase_gf(urls_file: Path, base: Path) -> Path:
 
     return outdir
 
+# ─── Phase 2d · WAF Detection ────────────────────────────────────────────────
+
+def phase_waf(live_urls_file: Path, base: Path, proxy_env=None) -> Path:
+    """Phase 2d: WAF detection on live hosts using wafw00f."""
+    phase_header("2d", "WAF Detection")
+    outdir = base / "waf"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    n = count_lines(live_urls_file) if live_urls_file and live_urls_file.exists() else 0
+    if n == 0:
+        warn("No live URLs — skipping WAF detection")
+        return outdir
+
+    if not which("wafw00f"):
+        warn("wafw00f not found  (pip install wafw00f)")
+        return outdir
+
+    out_json = outdir / "wafw00f_results.json"
+    info(f"Targets  : {n} URLs")
+
+    rc, stdout, _ = run(
+        ["wafw00f", "-i", str(live_urls_file), "-o", str(out_json), "-f", "json", "-a"],
+        env_extra=proxy_env, timeout=1800,
+    )
+
+    if out_json.exists() and out_json.stat().st_size > 0:
+        try:
+            data = json.loads(out_json.read_text())
+            if not isinstance(data, list):
+                data = []
+            detected   = [e for e in data if e.get("detected")]
+            no_waf     = [e for e in data if not e.get("detected")]
+            if detected:
+                ok(f"WAF detected on {bold(str(len(detected)))} host(s)  (of {n} checked):")
+                for e in detected:
+                    fw  = yellow(e.get("firewall", "?"))
+                    mfr = dim(f"[{e.get('manufacturer', '?')}]")
+                    print(f"    {cyan(e.get('url','?')):<60}  {fw}  {mfr}")
+            else:
+                info(f"No WAF detected  ({len(data)} hosts checked)")
+        except Exception:
+            # wafw00f JSON format varies — fall back to stdout line parsing
+            waf_lines = [l for l in stdout.splitlines()
+                         if "is behind" in l.lower() or "waf" in l.lower()]
+            if waf_lines:
+                ok(f"WAF lines from stdout:")
+                for l in waf_lines:
+                    print(f"    {l.strip()}")
+    else:
+        info("wafw00f: no results")
+
+    return outdir
+
+
+# ─── Phase 3.5 · JS Endpoint Extraction ──────────────────────────────────────
+
+_JS_EP_PATTERNS = [
+    re.compile(r'''["`'](/(?:api|v\d+|graphql|rest|gql|rpc|ws|socket)[a-zA-Z0-9/_\-.?=&%:@#]{2,200})["`' \t]'''),
+    re.compile(r'''(?:url|endpoint|path|href|action)\s*[:=]\s*["`']([a-zA-Z0-9/_\-.?=&%:@#]{5,200})["`']''', re.I),
+    re.compile(r'''fetch\(\s*["`']([^"`'\s]{5,200})["`']'''),
+    re.compile(r'''(?:axios|xhr|http)\.[a-z]+\(\s*["`']([^"`'\s]{5,200})["`']''', re.I),
+]
+
+_JS_NOISE = frozenset({
+    "jquery", "bootstrap", "analytics.js", "gtag", "fbevents", "hotjar",
+    "recaptcha", "google-analytics", "doubleclick", "googletagmanager",
+    "cdn.jsdelivr", "cdnjs.cloudflare", "unpkg.com", "min.js",
+})
+
+
+def _extract_js_endpoints(js_url: str, session, domain: str) -> list:
+    """Fetch one JS file and return in-scope endpoint strings."""
+    try:
+        r = session.get(js_url, timeout=(5, 10), allow_redirects=True)
+        if r.status_code != 200 or not r.text:
+            return []
+        content = r.text
+        endpoints = set()
+        parsed_js = urlparse(js_url)
+        js_base   = f"{parsed_js.scheme}://{parsed_js.netloc}"
+
+        for pat in _JS_EP_PATTERNS:
+            for m in pat.finditer(content):
+                ep = m.group(1).strip()
+                if len(ep) < 3:
+                    continue
+                if ep.startswith("http"):
+                    if domain in ep:
+                        endpoints.add(ep)
+                elif ep.startswith("/"):
+                    endpoints.add(js_base + ep)
+    except Exception:
+        return []
+    return list(endpoints)
+
+
+def phase_js_endpoints(
+    all_urls_file: Path,
+    base: Path,
+    domain: str,
+    proxies=None,
+) -> Path:
+    """Phase 3.5: Fetch JS files and extract API endpoints via regex + linkfinder."""
+    phase_header("3.5", "JS Endpoint Extraction")
+    outdir = base / "js_endpoints"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if not all_urls_file.exists() or count_lines(all_urls_file) == 0:
+        warn("No URLs — skipping JS extraction")
+        return outdir
+
+    js_urls = []
+    for line in all_urls_file.read_text().splitlines():
+        u = line.strip()
+        if not u:
+            continue
+        low = u.lower()
+        if ".js" not in low:
+            continue
+        if any(n in low for n in _JS_NOISE):
+            continue
+        js_urls.append(u)
+    js_urls = list(dict.fromkeys(js_urls))
+
+    if not js_urls:
+        info("No JS files found in URL list")
+        return outdir
+
+    info(f"JS files : {len(js_urls)}")
+
+    if not HAS_REQUESTS:
+        warn("requests not installed — cannot fetch JS files")
+        return outdir
+
+    import urllib3
+    urllib3.disable_warnings()
+    session = requests.Session()
+    session.verify = False
+    session.headers["User-Agent"] = DEFAULT_UA
+    if proxies:
+        session.proxies = proxies
+
+    all_endpoints: set = set()
+    lock = threading.Lock()
+
+    def _worker(u):
+        eps = _extract_js_endpoints(u, session, domain)
+        if eps:
+            with lock:
+                all_endpoints.update(eps)
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {ex.submit(_worker, u): u for u in js_urls}
+        done = 0
+        for f in as_completed(futs):
+            try:
+                f.result()
+            except Exception:
+                pass
+            done += 1
+            if done % 25 == 0:
+                info(f"  {done}/{len(js_urls)} processed  ({len(all_endpoints)} endpoints so far)")
+
+    # linkfinder pass if available
+    if which("linkfinder"):
+        info("  linkfinder pass ...")
+        lf_endpoints: set = set()
+        for u in js_urls[:100]:
+            rc, stdout, _ = run(["linkfinder", "-i", u, "-o", "cli"], timeout=30)
+            if rc == 0 and stdout.strip():
+                for line in stdout.splitlines():
+                    ep = line.strip()
+                    if ep.startswith("/") or ep.startswith("http"):
+                        lf_endpoints.add(ep)
+        if lf_endpoints:
+            (outdir / "linkfinder_raw.txt").write_text("\n".join(sorted(lf_endpoints)) + "\n")
+            ok(f"  linkfinder: {len(lf_endpoints)} additional endpoints")
+            all_endpoints.update(lf_endpoints)
+
+    if all_endpoints:
+        write_lines(outdir / "all_js_endpoints.txt", all_endpoints)
+        ok(f"JS endpoints : {bold(str(len(all_endpoints)))}  → js_endpoints/all_js_endpoints.txt")
+        # Append new endpoints to all_urls.txt so GF/nuclei can pick them up
+        try:
+            existing = set(all_urls_file.read_text().splitlines())
+            new_eps  = all_endpoints - existing
+            if new_eps:
+                with open(all_urls_file, "a") as fh:
+                    fh.write("\n".join(sorted(new_eps)) + "\n")
+                info(f"  {len(new_eps)} new endpoints appended to all_urls.txt")
+        except Exception as e:
+            warn(f"  Could not append to all_urls.txt: {e}")
+    else:
+        info("No endpoints extracted from JS files")
+
+    return outdir
+
+
 # ─── Phase 1.5 · DNS Brute Force ─────────────────────────────────────────────
 
 DEFAULT_BRUTEFORCE_WORDLIST = Path(
@@ -2181,7 +2383,7 @@ BUCKET_SUFFIXES = [
     "clientes", "usuarios", "pedidos", "vendas", "financeiro",
     "fiscal", "contabil", "rh", "juridico",
     # Common suffixes
-    "2023", "2024", "2025",
+    "2023", "2024", "2025", "2026",
 ]
 
 AZURE_CONTAINERS = [
@@ -2289,18 +2491,27 @@ COMMON_OBJECTS = [
 ]
 
 def _probe_objects(base_url: str, session) -> list:
-    """HEAD each common sensitive filename. Returns list of readable objects."""
+    """HEAD each common sensitive filename in parallel. Returns list of readable objects."""
     hits = []
-    for obj in COMMON_OBJECTS:
+    lock = threading.Lock()
+
+    def _head(obj):
         try:
-            r = session.head(f"{base_url}/{obj}", timeout=(4, 6), allow_redirects=True)
+            r = session.head(f"{base_url}/{obj}", timeout=(3, 5), allow_redirects=True)
             if r.status_code == 200:
-                size = r.headers.get("Content-Length", "?")
-                ct   = r.headers.get("Content-Type", "")
-                hits.append({"key": obj, "size": size, "content_type": ct,
-                             "url": f"{base_url}/{obj}"})
+                with lock:
+                    hits.append({
+                        "key":          obj,
+                        "size":         r.headers.get("Content-Length", "?"),
+                        "content_type": r.headers.get("Content-Type", ""),
+                        "url":          f"{base_url}/{obj}",
+                    })
         except Exception:
             pass
+
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        list(ex.map(_head, COMMON_OBJECTS))
+
     return hits
 
 def _probe_write(base_url: str, session, probe_key=".raptor-probe-bb",
@@ -2365,7 +2576,7 @@ def _parse_xml_listing(xml_body: str) -> dict:
         "sample_keys": keys[:15],
     }
 
-def _check_s3(name: str, session) -> dict | None:
+def _check_s3(name: str, session, probe_objects: bool = True) -> dict | None:
     """Check S3 bucket. Returns finding or None."""
     urls_to_try = [
         f"https://{name}.s3.amazonaws.com/",
@@ -2464,11 +2675,11 @@ def _check_s3(name: str, session) -> dict | None:
 
     result["writable"]    = _probe_write(base_url, session)
     result["deletable"]   = _probe_delete(base_url, session)
-    result["object_hits"] = _probe_objects(base_url, session)
+    result["object_hits"] = _probe_objects(base_url, session) if probe_objects else []
 
     return result
 
-def _check_gcs(name: str, session) -> dict | None:
+def _check_gcs(name: str, session, probe_objects: bool = True) -> dict | None:
     """Check GCS bucket — listing, IAM, CORS, write, delete, object enum."""
     found_url = None
     readable  = False
@@ -2556,11 +2767,11 @@ def _check_gcs(name: str, session) -> dict | None:
     # Write probe — GCS uses same REST as S3 for XML API
     result["writable"]    = _probe_write(base_url, session)
     result["deletable"]   = _probe_delete(base_url, session)
-    result["object_hits"] = _probe_objects(base_url, session)
+    result["object_hits"] = _probe_objects(base_url, session) if probe_objects else []
 
     return result
 
-def _check_azure(name: str, session) -> list:
+def _check_azure(name: str, session, probe_objects: bool = True) -> list:
     """
     Check Azure Blob Storage — list, ACL, CORS, write, delete, object enum.
     Tries common container names + static website endpoint.
@@ -2570,6 +2781,13 @@ def _check_azure(name: str, session) -> list:
         return []
 
     blob_base = f"https://{az}.blob.core.windows.net"
+
+    # Fast existence probe — catches DNS failures before we try 24+ containers
+    try:
+        session.head(f"{blob_base}/", timeout=(2, 3))
+    except Exception:
+        return []  # DNS failure or connection refused = account doesn't exist
+
     results   = []
 
     for container in AZURE_CONTAINERS:
@@ -2627,7 +2845,7 @@ def _check_azure(name: str, session) -> list:
                            "x-ms-version":   "2020-10-02"},
         )
         entry["deletable"]   = _probe_delete(cont_url, session)
-        entry["object_hits"] = _probe_objects(cont_url, session)
+        entry["object_hits"] = _probe_objects(cont_url, session) if probe_objects else []
 
         results.append(entry)
 
@@ -2712,7 +2930,8 @@ def _print_bucket(r: dict):
             for obj in r["object_hits"]:
                 print(f"      → {obj['url']}  ({obj['size']} bytes)")
 
-def phase_buckets(domain: str, base: Path, proxies: dict | None = None) -> list:
+def phase_buckets(domain: str, base: Path, proxies: dict | None = None,
+                  skip_objects: bool = False) -> list:
     """Phase 6: Cloud bucket discovery + permission + file-type audit (S3, GCS, Azure)."""
     phase_header(6, "Cloud Bucket Discovery")
 
@@ -2729,20 +2948,40 @@ def phase_buckets(domain: str, base: Path, proxies: dict | None = None) -> list:
         session.proxies = proxies
 
     names = _gen_bucket_names(domain)
-    info(f"Candidates : {len(names)} bucket names  (S3 · GCS · Azure)")
+    obj_note = "  [--no-bucket-objects: skipped]" if skip_objects else ""
+    info(f"Candidates : {len(names)} bucket names  (S3 · GCS · Azure){obj_note}")
 
     all_findings: list = []
     lock = threading.Lock()
 
+    probe_objs = not skip_objects
+
     def probe(name: str):
-        local = []
-        r = _check_s3(name, session)
-        if r:
-            local.append(r)
-        r = _check_gcs(name, session)
-        if r:
-            local.append(r)
-        local.extend(_check_azure(name, session))
+        local      = []
+        local_lock = threading.Lock()
+
+        def _s3():
+            r = _check_s3(name, session, probe_objects=probe_objs)
+            if r:
+                with local_lock: local.append(r)
+
+        def _gcs():
+            r = _check_gcs(name, session, probe_objects=probe_objs)
+            if r:
+                with local_lock: local.append(r)
+
+        def _azure():
+            for r in _check_azure(name, session, probe_objects=probe_objs):
+                with local_lock: local.append(r)
+
+        with ThreadPoolExecutor(max_workers=3) as _ex:
+            futs = [_ex.submit(_s3), _ex.submit(_gcs), _ex.submit(_azure)]
+            for f in as_completed(futs):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
         if local:
             with lock:
                 all_findings.extend(local)
@@ -2752,7 +2991,7 @@ def phase_buckets(domain: str, base: Path, proxies: dict | None = None) -> list:
     done_count = [0]
     lk = threading.Lock()
 
-    with ThreadPoolExecutor(max_workers=25) as ex:
+    with ThreadPoolExecutor(max_workers=50) as ex:
         futs = [ex.submit(probe, n) for n in names]
         for f in as_completed(futs):
             try:
@@ -2761,7 +3000,7 @@ def phase_buckets(domain: str, base: Path, proxies: dict | None = None) -> list:
                 pass
             with lk:
                 done_count[0] += 1
-                if done_count[0] % 50 == 0:
+                if done_count[0] % 25 == 0:
                     info(f"  {done_count[0]}/{len(names)} probed  found: {len(all_findings)}")
 
     out_dir = base / "buckets"
@@ -3304,13 +3543,17 @@ examples:
     g4.add_argument("--skip-enum",          action="store_true", help="Skip subdomain enumeration")
     g4.add_argument("--skip-httpx",         action="store_true", help="Skip httpx validation")
     g4.add_argument("--skip-fingerprint",   action="store_true", help="Skip technology/CMS fingerprinting (Phase 2c)")
+    g4.add_argument("--skip-waf",           action="store_true", help="Skip WAF detection (Phase 2d)")
     g4.add_argument("--skip-takeover",      action="store_true", help="Skip subdomain takeover detection (Phase 2.5)")
     g4.add_argument("--skip-urls",          action="store_true", help="Skip URL collection")
+    g4.add_argument("--skip-js-endpoints",  action="store_true", help="Skip JS endpoint extraction (Phase 3.5)")
     g4.add_argument("--skip-gf",            action="store_true", help="Skip GF pattern matching")
     g4.add_argument("--skip-nuclei",        action="store_true", help="Skip nuclei scanning")
     g4.add_argument("--skip-buckets",       action="store_true", help="Skip cloud bucket discovery")
     g4.add_argument("--buckets-only",       action="store_true",
                     help="Run only the bucket discovery phase — skip all other phases")
+    g4.add_argument("--no-bucket-objects",  action="store_true",
+                    help="Skip sensitive object enumeration in bucket scan (faster)")
 
     # Nuclei options
     g5 = p.add_argument_group("nuclei")
@@ -3411,6 +3654,16 @@ def main():
     else:
         warn("Fingerprinting skipped  (--skip-fingerprint)")
 
+    # ── Phase 2d · WAF Detection ──────────────────────────────────────────────
+    if not args.skip_waf:
+        _waf_input = live_urls_file if (live_urls_file and live_urls_file.exists()) else None
+        if _waf_input:
+            phase_waf(_waf_input, base, proxy_env=proxy_env)
+        else:
+            warn("WAF detection skipped — no live URLs available")
+    else:
+        warn("WAF detection skipped  (--skip-waf)")
+
     # ── Phase 2.5 · Subdomain Takeover Detection ──────────────────────────────
     if not args.skip_takeover:
         phase_takeover(
@@ -3439,6 +3692,17 @@ def main():
             args.domain, live_urls_file, base, args, proxies, proxy_env
         )
 
+    # ── Phase 3.5 · JS Endpoint Extraction ───────────────────────────────────
+    if not args.skip_js_endpoints:
+        phase_js_endpoints(
+            all_urls_file,
+            base,
+            domain=args.domain,
+            proxies=proxies if args.tor else None,
+        )
+    else:
+        warn("JS endpoint extraction skipped  (--skip-js-endpoints)")
+
     # ── Phase 4 · GF Pattern Matching ─────────────────────────────────────────
     if args.skip_gf:
         warn("GF pattern matching skipped")
@@ -3463,7 +3727,11 @@ def main():
 
     # ── Phase 6 · Cloud Bucket Discovery ─────────────────────────────────────
     if not args.skip_buckets:
-        phase_buckets(args.domain, base, proxies=proxies if args.tor else None)
+        phase_buckets(
+            args.domain, base,
+            proxies=proxies if args.tor else None,
+            skip_objects=args.no_bucket_objects,
+        )
     else:
         warn("Bucket discovery skipped  (--skip-buckets)")
 
