@@ -54,8 +54,11 @@ HTTP_PORTS = [
     8181, 8443, 9000, 9091, 9443, 9999, 10000, 15672,
     161, 2075, 2076, 3306, 3366, 3868, 4044,
 ]
-HTTPS_PORTS = {443, 8443, 9443, 4443, 6443, 2076, 10000, 5001}
-NMAP_PORTS  = ",".join(str(p) for p in sorted(set(HTTP_PORTS)))
+HTTPS_PORTS  = {443, 8443, 9443, 4443, 6443, 2076, 10000, 5001}
+NMAP_PORTS   = ",".join(str(p) for p in sorted(set(HTTP_PORTS)))
+
+_TOOL_DIR    = Path(__file__).resolve().parent
+_KEYHUNT_PATH = _TOOL_DIR / "Google-api-key-scanner" / "keyhunt.py"
 
 # JS from these domains is third-party / public library code — skip downloading entirely
 CDN_DOMAINS = {
@@ -335,6 +338,20 @@ SECRET_PATTERNS = [
     {"id": "linear_api_key",     "sev": "high",
      "re": r"lin_api_[A-Za-z0-9]{40}",
      "label": "Linear API Key"},
+    # ── E-commerce ────────────────────────────────────────────────────────────
+    {"id": "shopify_private_app",   "sev": "critical",
+     "re": r"shppa_[0-9a-fA-F]{64}",
+     "label": "Shopify Private App Password"},
+    {"id": "shopify_access_token",  "sev": "critical",
+     "re": r"shpat_[0-9a-fA-F]{64}",
+     "label": "Shopify Admin API Access Token"},
+    {"id": "shopify_shared_secret", "sev": "high",
+     "re": r"shpss_[0-9a-fA-F]{64}",
+     "label": "Shopify Shared Secret"},
+    # ── Database-as-a-Service ─────────────────────────────────────────────────
+    {"id": "planetscale_token",     "sev": "critical",
+     "re": r"pscale_tkn_[A-Za-z0-9_]{32,}",
+     "label": "PlanetScale Service Token"},
 ]
 
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -576,24 +593,59 @@ def _which_local(name):
     import subprocess as _sp
     return _sp.run(["which", name], capture_output=True).returncode == 0
 
-def _validate_google_maps(value, session=None, **_):
+def _validate_google_full(value, session=None, findings_dir=None, proxy_env=None, **_):
+    """Quick Maps geocoding probe + full keyhunt.py 21-endpoint permission sweep."""
+    # ── quick probe (1 request, fast) ────────────────────────────────────────
     sc, body = _req_get(
         f"https://maps.googleapis.com/maps/api/geocode/json"
         f"?address=1600+Amphitheatre+Parkway&key={value}",
         session=session)
+    quick_valid = None
+    quick_info  = f"HTTP {sc}"
     if sc == 200:
         try:
-            status = __import__("json").loads(body).get("status", "")
+            status = json.loads(body).get("status", "")
         except Exception:
             status = ""
         if status == "OK":
-            return {"valid": True,  "info": "Google Maps API key active (Geocoding)"}
-        if status == "REQUEST_DENIED":
-            return {"valid": False, "info": "Key exists but Geocoding API disabled"}
-        if status == "OVER_DAILY_LIMIT":
-            return {"valid": True,  "info": "Quota exceeded — key likely valid"}
-        return {"valid": None, "info": f"status={status}"}
-    return {"valid": None, "info": f"HTTP {sc}"}
+            quick_valid, quick_info = True,  "Maps Geocoding active"
+        elif status == "REQUEST_DENIED":
+            quick_valid, quick_info = False, "Key exists — Geocoding disabled"
+        elif status == "OVER_DAILY_LIMIT":
+            quick_valid, quick_info = True,  "Quota exceeded — key likely valid"
+        else:
+            quick_valid, quick_info = None,  f"status={status}"
+
+    # ── keyhunt.py: 21-endpoint permission map ────────────────────────────────
+    if quick_valid is not False and _KEYHUNT_PATH.is_file():
+        slug   = value[:8]
+        kh_out = None
+        if findings_dir:
+            kh_dir = Path(findings_dir) / "google_keys"
+            kh_dir.mkdir(parents=True, exist_ok=True)
+            kh_out = kh_dir / f"keyhunt_{slug}.txt"
+
+        cmd = ["python3", str(_KEYHUNT_PATH), "-k", value, "--poc", "-q"]
+        if kh_out:
+            cmd += ["-o", str(kh_out)]
+
+        rc, stdout, stderr = run(cmd, timeout=120, env_extra=proxy_env)
+        output = (stdout or "") + (stderr or "")
+        if kh_out and not kh_out.exists():
+            kh_out.write_text(output)
+
+        vuln_lines = [l.strip() for l in output.splitlines()
+                      if "[VULN]" in l or "[+]" in l]
+        if vuln_lines:
+            services = ", ".join(l.split("]", 1)[-1].strip() for l in vuln_lines[:6])
+            return {
+                "valid":    True,
+                "info":     f"{len(vuln_lines)} enabled service(s): {services}",
+                "keyhunt":  vuln_lines,
+            }
+        return {"valid": quick_valid, "info": quick_info + " | keyhunt: no enabled services"}
+
+    return {"valid": quick_valid, "info": quick_info}
 
 def _validate_mailchimp(value, session=None, **_):
     # Mailchimp DC is embedded in the key: key-usN → dc=usN
@@ -648,6 +700,96 @@ def _validate_digitalocean(value, session=None, **_):
         return {"valid": False, "info": "Invalid token"}
     return {"valid": None, "info": f"HTTP {sc}"}
 
+def _validate_supabase(value, session=None, **_):
+    try:
+        import base64 as _b64, json as _j
+        payload_b64 = value.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = _j.loads(_b64.b64decode(payload_b64).decode())
+        iss = payload.get("iss", "")
+        m = re.search(r'https://([a-z0-9]+)\.supabase\.co', iss)
+        if m:
+            ref = m.group(1)
+            sc, body = _req_get(
+                f"https://{ref}.supabase.co/rest/v1/",
+                headers={"apikey": value, "Authorization": f"Bearer {value}"},
+                session=session)
+            if sc == 200:
+                return {"valid": True,  "info": f"Supabase key valid (project: {ref})"}
+            if sc == 401:
+                return {"valid": False, "info": "Invalid key"}
+    except Exception:
+        pass
+    return {"valid": None, "info": "Project URL not in JWT — check manually"}
+
+def _validate_postman(value, session=None, **_):
+    sc, body = _req_get(
+        "https://api.getpostman.com/me",
+        headers={"X-Api-Key": value},
+        session=session)
+    if sc == 200:
+        user = re.search(r'"username"\s*:\s*"([^"]+)"', body)
+        return {"valid": True,  "info": f"Postman user: {user.group(1) if user else '?'}"}
+    if sc == 401:
+        return {"valid": False, "info": "Invalid key"}
+    return {"valid": None, "info": f"HTTP {sc}"}
+
+def _validate_linear(value, session=None, **_):
+    try:
+        r = (session or requests).post(
+            "https://api.linear.app/graphql",
+            headers={"Authorization": value, "Content-Type": "application/json"},
+            json={"query": "{ viewer { id name } }"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            name = ((r.json().get("data") or {}).get("viewer") or {}).get("name", "?")
+            return {"valid": True,  "info": f"Linear user: {name}"}
+        if r.status_code == 401:
+            return {"valid": False, "info": "Invalid key"}
+        return {"valid": None, "info": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"valid": None, "info": str(e)}
+
+def _validate_pypi(value, session=None, **_):
+    try:
+        r = (session or requests).post(
+            "https://upload.pypi.org/legacy/",
+            auth=("__token__", value),
+            data={"action": "file_upload"},
+            timeout=10,
+        )
+        if r.status_code in (400, 422):   # auth accepted, bad/missing form data
+            return {"valid": True,  "info": "PyPI token valid (auth accepted)"}
+        if r.status_code == 403:
+            return {"valid": False, "info": "Invalid or revoked token"}
+        return {"valid": None, "info": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"valid": None, "info": str(e)}
+
+def _validate_firebase_server_key(value, session=None, **_):
+    try:
+        r = (session or requests).post(
+            "https://fcm.googleapis.com/fcm/send",
+            headers={"Authorization": f"key={value}", "Content-Type": "application/json"},
+            json={"to": "invalid_probe_token"},
+            timeout=10,
+        )
+        if r.status_code == 400:   # auth OK, invalid target token
+            return {"valid": True,  "info": "Firebase server key valid (FCM accepted)"}
+        if r.status_code == 200:
+            return {"valid": True,  "info": "Firebase server key valid"}
+        if r.status_code == 401:
+            return {"valid": False, "info": "Invalid server key"}
+        return {"valid": None, "info": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"valid": None, "info": str(e)}
+
+def _validate_shopify(value, session=None, **_):
+    # Without the shop domain we cannot call the Admin API.
+    # The token format alone is sufficient evidence; flag as unknown.
+    return {"valid": None, "info": "Shop domain needed for live validation — report as found"}
+
 # pattern_id → validator function
 KEY_VALIDATORS = {
     "github_pat_fine":    _validate_github,
@@ -666,13 +808,19 @@ KEY_VALIDATORS = {
     "huggingface":        _validate_huggingface,
     "discord_webhook":    _validate_discord_webhook,
     "mapbox_token":       _validate_mapbox,
-    # New validators
-    "aws_access_key":     _validate_aws,
-    "google_api_key":     _validate_google_maps,
-    "mailchimp_key":      _validate_mailchimp,
-    "twilio_auth_token":  _validate_twilio,
-    "cloudflare_api_key": _validate_cloudflare,
-    "digitalocean_token": _validate_digitalocean,
+    "aws_access_key":        _validate_aws,
+    "google_api_key":        _validate_google_full,
+    "mailchimp_key":         _validate_mailchimp,
+    "twilio_auth_token":     _validate_twilio,
+    "cloudflare_api_key":    _validate_cloudflare,
+    "digitalocean_token":    _validate_digitalocean,
+    "supabase_key":          _validate_supabase,
+    "postman_api_key":       _validate_postman,
+    "linear_api_key":        _validate_linear,
+    "pypi_token":            _validate_pypi,
+    "firebase_key":          _validate_firebase_server_key,
+    "shopify_private_app":   _validate_shopify,
+    "shopify_access_token":  _validate_shopify,
 }
 
 # ─── Endpoint Patterns ────────────────────────────────────────────────────────
@@ -690,6 +838,17 @@ COMMON_JS_PATHS = [
     "/js/app.js", "/js/main.js", "/js/config.js", "/js/settings.js",
     "/js/env.js", "/env.js", "/config.js", "/settings.js",
     "/runtime.js", "/polyfills.js", "/chunk-vendors.js",
+    # Next.js
+    "/_next/static/chunks/main.js",
+    "/_next/static/chunks/pages/_app.js",
+    "/_next/static/chunks/webpack.js",
+    # Service workers (hardcode URLs, API keys, push keys)
+    "/sw.js", "/service-worker.js", "/firebase-messaging-sw.js",
+    "/precache-manifest.js",
+    # Nuxt / Vue
+    "/_nuxt/app.js", "/_nuxt/runtime.js",
+    # Vite / modern bundlers
+    "/assets/index.js", "/dist/assets/index.js",
 ]
 
 # ─── Colors / Logging ─────────────────────────────────────────────────────────
@@ -1327,7 +1486,7 @@ def scan_secrets(url_map, sourcemap_files, findings_dir, sev_filter, threads):
 
 # ─── Phase 4b · Key Validation ────────────────────────────────────────────────
 
-def validate_keys(findings, findings_dir, session, threads=8):
+def validate_keys(findings, findings_dir, session, threads=8, proxy_env=None):
     phase_header("4b", "Key Validation")
 
     validatable = [f for f in findings if f["pattern"] in KEY_VALIDATORS]
@@ -1336,6 +1495,8 @@ def validate_keys(findings, findings_dir, session, threads=8):
         return findings
 
     info(f"Validating {len(validatable)} keys against live APIs...")
+    if _KEYHUNT_PATH.is_file():
+        info(f"keyhunt.py available → Google keys get 21-endpoint permission sweep")
 
     # Deduplicate by value (same key in multiple files = validate once)
     by_value = {}
@@ -1347,7 +1508,7 @@ def validate_keys(findings, findings_dir, session, threads=8):
 
     def validate_one(value, finding):
         fn = KEY_VALIDATORS[finding["pattern"]]
-        result = fn(value, session=session)
+        result = fn(value, session=session, findings_dir=findings_dir, proxy_env=proxy_env)
         with lock:
             results[value] = result
         valid_line(finding["label"], result.get("info", ""), result.get("valid"))
@@ -1566,6 +1727,7 @@ SENSITIVE_PATHS = [
     "/.env", "/.env.local", "/.env.production", "/.env.prod",
     "/.env.staging", "/.env.development", "/.env.dev",
     "/.env.backup", "/.env.bak", "/.env.old", "/.env.example",
+    "/.env.test", "/.env.ci",
     # Config files that are sometimes accidentally exposed
     "/config.json", "/config.js", "/config.yaml", "/config.yml",
     "/settings.json", "/settings.py", "/app.config.js",
@@ -1586,6 +1748,27 @@ SENSITIVE_PATHS = [
     "/.git/config", "/.svn/entries",
     # PHP/Laravel/Symfony
     "/.env.php", "/laravel/.env", "/.symfony.env",
+    "/storage/logs/laravel.log",
+    "/_profiler/",
+    "/telescope",
+    # Rails
+    "/config/database.yml", "/config/secrets.yml",
+    "/config/credentials.yml.enc",
+    # Spring Boot actuators (frequent in Java)
+    "/actuator/env", "/actuator/heapdump", "/actuator/configprops",
+    "/actuator/mappings",
+    # Server-level exposures
+    "/.htaccess", "/web.config", "/server-status",
+    "/WEB-INF/web.xml", "/META-INF/MANIFEST.MF",
+    # PHP debug pages
+    "/phpinfo.php", "/info.php", "/test.php",
+    # Cloud credentials
+    "/.npmrc", "/.aws/credentials", "/.aws/config",
+    "/.pip/pip.conf", "/.pypirc",
+    # Shell history / SSH (misconfigured web roots)
+    "/.bash_history", "/.ssh/id_rsa", "/.ssh/id_ecdsa",
+    # Node / package metadata
+    "/package.json", "/.nvmrc",
 ]
 
 def probe_sensitive_files(hosts_file, extra_hosts, session, ua, findings_dir, threads, sev_filter):
@@ -1621,8 +1804,9 @@ def probe_sensitive_files(hosts_file, extra_hosts, session, ua, findings_dir, th
                 if r.status_code != 200 or len(r.content) > 1_000_000:
                     continue
                 ct = r.headers.get("content-type", "")
-                # Skip obvious HTML pages (login redirects, 404 pages etc.)
-                if "text/html" in ct and "<html" in r.text[:200].lower():
+                snippet = r.text[:300].lower().strip()
+                # Skip HTML pages: login redirects, 404 pages, etc.
+                if "text/html" in ct or snippet.startswith(("<!doctype", "<html", "<head")):
                     continue
                 # Scan content for secrets
                 hits = _scan_text(r.text, f"{url} [probe]", sev_filter)
@@ -1827,10 +2011,13 @@ def main():
     sev_filter = set(s.strip().lower() for s in args.severity.split(","))
 
     # ── HTTP session ──────────────────────────────────────────────────────────
+    proxy_env = None
     session = requests.Session()
     if args.tor:
         tor = "socks5h://127.0.0.1:9050"
         session.proxies = {"http": tor, "https": tor}
+        proxy_env = {"HTTP_PROXY": tor, "HTTPS_PROXY": tor,
+                     "http_proxy": tor, "https_proxy": tor}
         info(f"TOR proxy: {tor}")
     session.headers["User-Agent"] = args.user_agent
     session.verify = False  # many targets have self-signed certs
@@ -1928,7 +2115,7 @@ def main():
 
     # ── Phase 4b: Key Validation ──────────────────────────────────────────────
     if not args.no_validate and findings:
-        findings = validate_keys(findings, findings_dir, session, threads=8)
+        findings = validate_keys(findings, findings_dir, session, threads=8, proxy_env=proxy_env)
     elif args.no_validate:
         warn("Key validation skipped (--no-validate)")
 
@@ -1941,7 +2128,10 @@ def main():
             findings_dir, args.threads, sev_filter,
         )
         if env_findings:
-            findings = findings + env_findings
+            if not args.no_validate:
+                env_findings = validate_keys(
+                    env_findings, findings_dir, session, threads=8, proxy_env=proxy_env)
+            findings = _dedup(findings + env_findings)
     else:
         warn("Sensitive file probe skipped (--no-env-probe)")
 

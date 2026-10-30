@@ -19,6 +19,7 @@ Phases:
   13  WebSocket       ws:// wss:// extraction + open-auth probe
   14  CI/CD Exposure  Jenkins · Spring Actuator · phpinfo · Laravel Telescope · Adminer
   15  Next.js Probe   BUILD_ID → /_next/data/ JSON endpoint harvest
+  16  Exploit Mapper  CVEs detectados → tools/cve/<CVE-ID>/ (exploits locais)
 
 Input (auto-detected from --recon-dir):
   httpx/httpx_results.jsonl    → tech + status codes (for phases 4, 9, 15)
@@ -60,7 +61,8 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-RAPTOR_DIR = Path(os.environ.get("RAPTOR_DIR", Path(__file__).resolve().parent.parent))
+RAPTOR_DIR    = Path(os.environ.get("RAPTOR_DIR", Path(__file__).resolve().parent.parent))
+RAPTOR_CVE_DIR = RAPTOR_DIR / "tools" / "cve"
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -104,6 +106,19 @@ REQUIRED_HEADERS = [
         "missing": "Referrer-Policy absent — full URL sent in Referer header to third parties",
         "check":   lambda v: v.lower() not in ("unsafe-url", ""),
     },
+    {
+        "name":    "Permissions-Policy",
+        "sev":     "low",
+        "missing": "Permissions-Policy absent — camera, microphone, geolocation APIs unrestricted",
+        "check":   None,
+    },
+    {
+        "name":    "Cross-Origin-Opener-Policy",
+        "sev":     "low",
+        "missing": "COOP absent — cross-origin window access possible (Spectre side-channel)",
+        "check":   lambda v: v.lower() in ("same-origin", "same-origin-allow-popups"),
+        "bad":     "COOP set but not same-origin",
+    },
 ]
 
 INFO_DISCLOSURE_HEADERS = [
@@ -118,6 +133,10 @@ INFO_DISCLOSURE_HEADERS = [
     "X-Debug-Token",
     "X-Debug-Token-Link",
     "X-CF-Powered-By",
+    "X-Backend-Server",
+    "X-OWA-Version",
+    "X-Cluster-Client-IP",
+    "Via",
 ]
 
 CORS_HEADERS = ["Access-Control-Allow-Origin", "Access-Control-Allow-Credentials"]
@@ -219,6 +238,8 @@ SWAGGER_PATHS = [
     "/swagger/v1/swagger.json", "/swagger/v2/swagger.json",
     "/docs/swagger.json", "/docs/openapi.json",
     "/.well-known/openapi.json", "/redoc.json",
+    "/swagger-ui.html", "/swagger-ui/",
+    "/api/swagger-ui.html", "/actuator/openapi",
 ]
 
 # ─── 403 Bypass ───────────────────────────────────────────────────────────────
@@ -244,6 +265,8 @@ BYPASS_PATH_TRANSFORMS = [
     lambda p: "/." + p.lstrip("/"),
     lambda p: p + "%20",
     lambda p: p.upper(),
+    lambda p: p.rstrip("/") + "..;/",          # nginx alias + Tomcat bypass
+    lambda p: p.replace("/", "%252f", 1),       # double URL-encode (WAF bypass)
 ]
 
 # Patterns that indicate a generic application/server error page rather than
@@ -297,6 +320,9 @@ _CICD_JSON_PATHS = {
     "/actuator", "/actuator/env", "/actuator/health", "/actuator/mappings",
     "/actuator/beans", "/actuator/configprops", "/actuator/httptrace",
     "/actuator/threaddump", "/actuator/heapdump",
+    "/_cat/indices", "/_cluster/health", "/_nodes",
+    "/consul/v1/catalog/services", "/consul/v1/status/leader",
+    "/api/v1/namespaces",
 }
 
 # Keywords that must appear in the body for certain high-value HTML paths
@@ -313,6 +339,11 @@ _CICD_BODY_SIGNATURES = {
     "/.git/config":     ["[core]", "[remote"],
     "/.git/HEAD":       ["ref:", "master", "main"],
     "/web.config":      ["<configuration>", "system.web"],
+    "/wp-login.php":    ["wp-login", "wordpress", "log in"],
+    "/wp-admin/":       ["wordpress", "dashboard", "admin"],
+    "/kibana/":         ["kibana"],
+    "/app/kibana":      ["kibana"],
+    "/minio/":          ["minio", "buckets"],
 }
 
 CICD_PATHS = [
@@ -359,6 +390,25 @@ CICD_PATHS = [
     ("/.DS_Store",                       "macOS .DS_Store",        "low"),
     ("/crossdomain.xml",                 "Flash crossdomain",      "low"),
     ("/clientaccesspolicy.xml",          "Silverlight policy",     "low"),
+    # WordPress
+    ("/wp-login.php",                    "WordPress Login",        "medium"),
+    ("/wp-admin/",                       "WordPress Admin",        "high"),
+    # Elasticsearch
+    ("/_cat/indices",                    "Elasticsearch indices",  "critical"),
+    ("/_cluster/health",                 "Elasticsearch health",   "high"),
+    ("/_nodes",                          "Elasticsearch nodes",    "high"),
+    # Kibana
+    ("/kibana/",                         "Kibana Dashboard",       "high"),
+    ("/app/kibana",                      "Kibana App",             "high"),
+    # MinIO
+    ("/minio/",                          "MinIO Console",          "high"),
+    ("/minio/health/live",               "MinIO health",           "medium"),
+    # HashiCorp Consul
+    ("/consul/v1/catalog/services",      "Consul service catalog", "critical"),
+    ("/consul/v1/status/leader",         "Consul status",          "high"),
+    # Kubernetes API (sometimes exposed on 80/443)
+    ("/api/v1/namespaces",               "Kubernetes API",         "critical"),
+    ("/readyz",                          "K8s readiness probe",    "medium"),
 ]
 
 # ─── DNS DKIM Selectors ───────────────────────────────────────────────────────
@@ -382,15 +432,6 @@ TECH_CVE_LOCAL = {
         ("startswith:7.2",   None,              7.5, "PHP 7.2 EOL since November 2020"),
         ("startswith:7.3",   None,              7.5, "PHP 7.3 EOL since December 2021"),
         ("eq:8.1.0",         "CVE-2022-31626",  8.8, "password_hash() buffer overflow → potential RCE"),
-    ],
-    "apache httpd": [
-        ("eq:2.4.49",        "CVE-2021-41773",  9.8, "Path traversal + optional RCE via mod_cgi (actively exploited)"),
-        ("eq:2.4.50",        "CVE-2021-42013",  9.8, "Path traversal bypass → RCE"),
-        ("startswith:2.2",   None,              8.0, "Apache 2.2 EOL — multiple unfixed CVEs"),
-    ],
-    "nginx": [
-        ("lt:1.20.1",        "CVE-2021-23017",  7.7, "1-byte memory overwrite via DNS resolver"),
-        ("lt:1.22.1",        "CVE-2022-41741",  7.1, "Memory corruption in MP4 module"),
     ],
     "jquery": [
         ("lt:3.5.0",         "CVE-2020-11022",  6.1, "XSS via .html()/.load()/.append()"),
@@ -434,6 +475,111 @@ TECH_CVE_LOCAL = {
     ],
     "telerik": [
         ("lt:2020.1.114",    "CVE-2019-18935", 10.0, "Telerik UI RadAsyncUpload deserialization RCE"),
+    ],
+
+    # ── Network / Infra ──────────────────────────────────────────────────────
+    "netscaler": [
+        (None,               "CVE-2026-88771",  9.8, "RCE via log poisoning unauth — script de manutenção parseia logs sem sanitização (KEV CISA, exploração massiva)"),
+        (None,               "CVE-2026-88772",  8.1, "NetScaler ADC/Gateway — mesma família CVE-2026-88771 (par de exploração)"),
+    ],
+    "citrix adc": [
+        (None,               "CVE-2026-88771",  9.8, "RCE via log poisoning unauth (KEV CISA, exploração massiva)"),
+    ],
+    "forticlient ems": [
+        (None,               "CVE-2026-35616",  9.1, "Pre-auth bypass via X-SSL-CLIENT-VERIFY header spoofing → forjar cert FortiGate → acesso completo"),
+    ],
+    "fortimail": [
+        (None,               "CVE-2026-104286", 9.8, "Path traversal + null byte → arbitrary file write → backdoor (KEV CISA, sem patch em dez/2026)"),
+    ],
+    "cisco fmc": [
+        (None,               "CVE-2026-20079", 10.0, "RCE root unauth via boot process flaw — sem workaround disponível"),
+    ],
+
+    # ── Web Servers ───────────────────────────────────────────────────────────
+    "nginx": [
+        ("lt:1.20.1",        "CVE-2021-23017",  7.7, "1-byte memory overwrite via DNS resolver"),
+        ("lt:1.22.1",        "CVE-2022-41741",  7.1, "Memory corruption in MP4 module"),
+        ("lt:1.30.1",        "CVE-2026-42945",  9.8, "NGINX Rift — heap overflow em rewrite module (size/write-pass mismatch) → DoS/RCE (ASLR disabled)"),
+    ],
+    "nginx-ui": [
+        (None,               "CVE-2026-27944",  9.8, "Backup endpoint unauth retorna AES key em plaintext → decrypt backup"),
+        (None,               "CVE-2026-33032",  9.8, "Auth bypass em /mcp_message → controle total nginx (chain com CVE-2026-27944)"),
+    ],
+    "apache httpd": [
+        ("eq:2.4.49",        "CVE-2021-41773",  9.8, "Path traversal + optional RCE via mod_cgi (actively exploited)"),
+        ("eq:2.4.50",        "CVE-2021-42013",  9.8, "Path traversal bypass → RCE"),
+        ("startswith:2.2",   None,              8.0, "Apache 2.2 EOL — multiple unfixed CVEs"),
+        ("eq:2.4.66",        "CVE-2026-23918",  8.8, "HTTP/2 double-free em mod_http2 → DoS/RCE (Debian + Docker)"),
+        ("lt:2.4.67",        "CVE-2026-28780",  9.8, "mod_proxy_ajp heap buffer overflow → RCE"),
+    ],
+
+    # ── Runtime / Platform ────────────────────────────────────────────────────
+    "redis": [
+        ("lt:8.2.2",         "CVE-2025-49844", 10.0, "RediShell — Lua UAF de 13 anos → escape sandbox → RCE no host (EVAL autenticado)"),
+    ],
+    "erlang": [
+        (None,               "CVE-2025-32433", 10.0, "SSH processa mensagens de conexão antes de auth completa → RCE unauth (KEV CISA)"),
+    ],
+    "otp": [
+        (None,               "CVE-2025-32433", 10.0, "Erlang/OTP SSH RCE unauth — processa msgs pré-auth (KEV CISA)"),
+    ],
+
+    # ── JS Frameworks ─────────────────────────────────────────────────────────
+    "next.js": [
+        ("lt:15.5.16",       "CVE-2026-44578",  8.6, "SSRF via WebSocket upgrade handler — GET porta 80 only, self-hosted, IMDSv2 não explorável"),
+        ("lt:16.2.5",        "CVE-2026-44572",  8.1, "Next.js 16.2.4 batch — middleware bypass, connection exhaustion, routing mismatch"),
+    ],
+
+    # ── AI / ML / Automation Platforms ────────────────────────────────────────
+    "metabase": [
+        (None,               "CVE-2026-72898", 10.0, "SQLi via POST /api/session/reset_password → admin RCE (KEV CISA, exploração ativa)"),
+    ],
+    "langflow": [
+        (None,               "CVE-2026-33017",  9.8, "exec() sem sandbox em flows públicos → RCE unauth"),
+        (None,               "CVE-2026-0770",   9.8, "exec_globals no endpoint /validate → RCE"),
+        (None,               "CVE-2026-5027",   9.8, "Path traversal /api/v2/files → cron injection → RCE"),
+        (None,               "CVE-2026-55450",  9.8, "Langflow RCE chain variant 4"),
+    ],
+    "n8n": [
+        ("lt:1.70.0",        "CVE-2025-26776",  9.9, "Expression injection via this.process.mainModule → RCE (unauth em versões antigas)"),
+    ],
+    "flowise": [
+        (None,               "CVE-2025-64446",  9.8, "RCE unauth via /api/v1/node-load-method/customMCP listActions"),
+        (None,               "CVE-2025-13315",  9.8, "Flowise RCE — forgot-password token leak → Function() exec"),
+    ],
+    "gogs": [
+        (None,               "CVE-2025-8110",   9.8, "CSRF → RCE via symlink write (explorado em HTB Silentium)"),
+    ],
+
+    # ── Grafana ───────────────────────────────────────────────────────────────
+    "grafana": [
+        ("lt:8.0.7",         "CVE-2021-43798",  9.8, "Plugin path traversal → leitura arbitrária de arquivos (35+ plugins, grafana.db em plaintext)"),
+        (None,               "CVE-2025-4123",  10.0, "Ghost — path traversal + open redirect XSS (versão recente)"),
+        (None,               "CVE-2024-9264",   9.1, "DuckDB SQLi via query field (requer DuckDB plugin)"),
+        ("lt:9.4.13",        "CVE-2023-2183",   8.1, "Auth bypass via API"),
+    ],
+    # ── Frontend Libraries ────────────────────────────────────────────────────
+    "vue": [
+        ("startswith:2.",    None,              7.5, "Vue 2 EOL since December 2023 — no security patches"),
+    ],
+    "angularjs": [
+        ("startswith:1.",    None,              8.0, "AngularJS 1.x EOL since December 2021 — prototype pollution + XSS"),
+    ],
+    "lodash": [
+        ("lt:4.17.19",       "CVE-2020-8203",   7.4, "Prototype pollution via Object.merge()"),
+        ("lt:4.17.21",       "CVE-2021-23337",  7.2, "Command injection via template"),
+    ],
+    "moment": [
+        ("lt:2.29.4",        "CVE-2022-31129",  7.5, "ReDoS in date string parsing"),
+        (None,               None,              5.0, "moment.js EOL — maintainers recommend migration to date-fns/luxon/dayjs"),
+    ],
+    "bootstrap": [
+        ("lt:3.4.1",         "CVE-2019-8331",   6.1, "XSS via data-template attribute in tooltip/popover"),
+        ("lt:4.3.1",         "CVE-2019-8331",   6.1, "XSS via data-template attribute in tooltip/popover"),
+    ],
+    "handlebars": [
+        ("lt:4.7.7",         "CVE-2021-23369",  9.8, "RCE via template injection — prototype pollution to code execution"),
+        ("lt:4.7.7",         "CVE-2021-23383",  9.8, "Prototype pollution in compiler"),
     ],
 }
 
@@ -714,6 +860,16 @@ def _analyze_csp(csp_value: str, host: str, findings: list):
                      host, "CSP missing object-src — Flash/plugin injection possible",
                      evidence=csp_value[:200])
 
+    if "base-uri" not in directives:
+        _add_finding(findings, "csp", "medium", "csp_missing_base_uri",
+                     host, "CSP missing base-uri — <base href=//evil.com> injection possible",
+                     evidence=csp_value[:200])
+
+    if "form-action" not in directives and "default-src" not in directives:
+        _add_finding(findings, "csp", "low", "csp_missing_form_action",
+                     host, "CSP missing form-action — form submission hijacking possible",
+                     evidence=csp_value[:200])
+
     return has_frame_ancestors
 
 def _analyze_cors(headers: dict, host: str, findings: list):
@@ -728,6 +884,24 @@ def _analyze_cors(headers: dict, host: str, findings: list):
                      host, f"CORS with credentials: ACAO={acao} + ACAC=true",
                      detail="Origin reflection with allow-credentials=true → session theft if origin accepted",
                      evidence=f"ACAO: {acao}")
+
+def _probe_cors_active(session, host: str, findings: list):
+    """Active CORS probe: send Origin: evil.com and Origin: null, detect reflection."""
+    for origin in ("https://evil.com", "null"):
+        r = _safe_get(session, host, headers={"Origin": origin}, timeout=8)
+        if not r:
+            continue
+        acao = r.headers.get("Access-Control-Allow-Origin", "")
+        acac = r.headers.get("Access-Control-Allow-Credentials", "").lower()
+        if acao == origin:
+            sev    = "critical" if acac == "true" else "high"
+            detail = f"Origin: {origin!r} → ACAO: {acao}" + (" + ACAC: true" if acac == "true" else "")
+            _add_finding(findings, "cors", sev, "cors_reflection",
+                         host,
+                         f"CORS reflects arbitrary origin {'with credentials' if acac == 'true' else '(no credentials)'}",
+                         detail=detail,
+                         evidence={"origin_sent": origin, "acao": acao, "acac": acac})
+            break  # one finding per host is enough
 
 def phase_headers(live_hosts: list, outdir: Path, session, findings: list, threads: int = 20):
     phase_header("0+1+2", "Header · CSP · Cookie Audit")
@@ -748,7 +922,13 @@ def phase_headers(live_hosts: list, outdir: Path, session, findings: list, threa
         if r is None:
             return host, None, err_buf[0] if err_buf else "no response"
         hdrs = {k.lower(): v for k, v in r.headers.items()}
-        return host, {"status": r.status_code, "headers": hdrs, "url": r.url}, None
+        # urllib3 preserves duplicate Set-Cookie headers; requests merges them into one
+        try:
+            raw_cookies = list(r.raw.headers.getlist("set-cookie"))
+        except Exception:
+            raw_cookies = []
+        return host, {"status": r.status_code, "headers": hdrs, "url": r.url,
+                      "raw_cookies": raw_cookies}, None
 
     n_ok = 0
     n_fail = 0
@@ -827,15 +1007,12 @@ def phase_headers(live_hosts: list, outdir: Path, session, findings: list, threa
                              host, f"Server info disclosure via {h}: {val[:80]}",
                              evidence=f"{h}: {val}")
 
-        # CORS
+        # CORS — passive (baseline headers) + active probe (reflected origin check)
         _analyze_cors(hdrs, host, findings)
+        _probe_cors_active(session, host, findings)
 
-        # Cookie audit
-        set_cookies = []
-        for k, v in data["headers"].items():
-            if k.lower() == "set-cookie":
-                set_cookies.append(v)
-        # requests merges multi-value headers; try raw
+        # Cookie audit — use urllib3 raw headers to handle multiple Set-Cookie values
+        set_cookies = data.get("raw_cookies") or []
         if not set_cookies:
             raw_cookie = hdrs.get("set-cookie", "")
             if raw_cookie:
@@ -1195,7 +1372,7 @@ def phase_content_recon(live_hosts: list, outdir: Path, session, findings: list,
         result["sitemap_urls"] = list(sitemap_urls)[:200]
 
         # .well-known
-        for wk in ("//.well-known/security.txt", "/.well-known/change-password"):
+        for wk in ("/.well-known/security.txt", "/security.txt", "/.well-known/change-password"):
             r = _safe_get(session, host + wk.lstrip("/"), timeout=8)
             if r and r.status_code == 200:
                 result["wellknown"].append({"path": wk, "body": r.text[:500]})
@@ -1978,6 +2155,55 @@ def phase_nextjs(live_hosts: list, httpx_jsonl: Path, outdir: Path, session,
 
     ok(f"  Next.js phase done")
 
+# ─── Phase 16 · Exploit Mapper ────────────────────────────────────────────────
+
+_CVE_RE = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
+
+def phase_exploit_mapper(findings: list, outdir: Path):
+    """
+    Phase 16 — Map CVEs detected in previous phases to local exploits in tools/cve/.
+    Prints path + files for every CVE that has a matching subdirectory.
+    """
+    phase_header("16", "Exploit Mapper — Local CVE Inventory")
+
+    if not RAPTOR_CVE_DIR.exists():
+        warn(f"  tools/cve/ not found at {RAPTOR_CVE_DIR} — skipping")
+        return
+
+    # Collect CVE IDs from all findings
+    cve_ids: set = set()
+    for f in findings:
+        text = str(f.get("title", "")) + " " + str(f.get("detail", ""))
+        for m in _CVE_RE.findall(text):
+            cve_ids.add(m.upper())
+
+    if not cve_ids:
+        info("  No CVE findings from previous phases — skipping exploit mapper")
+        return
+
+    hits = []
+    for cve_id in sorted(cve_ids):
+        cve_dir = RAPTOR_CVE_DIR / cve_id
+        if cve_dir.exists() and cve_dir.is_dir():
+            files = sorted(p.name for p in cve_dir.iterdir() if p.is_file())
+            hits.append({"cve": cve_id, "path": str(cve_dir), "files": files})
+
+    if hits:
+        ok(f"  {len(hits)}/{len(cve_ids)} CVEs have local exploits in tools/cve/:")
+        for hit in hits:
+            print(f"    {bold(hit['cve'])}  →  {cyan(hit['path'])}")
+            for fname in hit["files"][:4]:
+                print(f"      {dim(fname)}")
+            if len(hit["files"]) > 4:
+                extra = len(hit["files"]) - 4
+                print(f"      {dim(f'… {extra} more')}")
+        (outdir / "exploit_map.json").write_text(json.dumps(hits, indent=2))
+        ok(f"  exploit_map.json written")
+    else:
+        missing = sorted(cve_ids)[:8]
+        info(f"  No local exploits matched {len(cve_ids)} detected CVEs")
+        info(f"  Checked: {', '.join(missing)}{'…' if len(cve_ids) > 8 else ''}")
+
 # ─── Report ───────────────────────────────────────────────────────────────────
 
 def write_report(base: Path, findings: list, target: str, phases_run: list):
@@ -2072,6 +2298,7 @@ def build_parser():
     p.add_argument("--skip-ws",       action="store_true", help="Skip phase 13 (WebSocket)")
     p.add_argument("--skip-cicd",     action="store_true", help="Skip phase 14 (CI/CD)")
     p.add_argument("--skip-nextjs",   action="store_true", help="Skip phase 15 (Next.js probe)")
+    p.add_argument("--skip-exploits", action="store_true", help="Skip phase 16 (exploit mapper — tools/cve/ lookup)")
     return p
 
 def _banner():
@@ -2255,6 +2482,11 @@ def main():
     if not args.skip_nextjs:
         phase_nextjs(live_hosts, httpx_jsonl, base, session, findings, threads=args.threads)
         phases_run.append(15)
+
+    # ── Phase 16: Exploit Mapper ─────────────────────────────────────────────
+    if not args.skip_exploits:
+        phase_exploit_mapper(findings, base)
+        phases_run.append(16)
 
     # ── Save findings ────────────────────────────────────────────────────────
     findings_path = base / "findings.jsonl"

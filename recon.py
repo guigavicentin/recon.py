@@ -3,8 +3,10 @@
 recon.py — Full recon pipeline  v1.3
 
   Phase 1    Subdomain enum    crt.sh · chaos · github-subdomains · assetfinder · subfinder
+                               shodanx · subcat · alienvault OTX · webarchive · urlscan.io
   Phase 1.5  DNS brute force   puredns / dnsx / massdns  [opt-in: --brute-force]
-  Phase 2    httpx validation  live hosts + IP extraction (hosts/ + ips/)
+  Phase 2    httpx validation  live hosts + IP extraction — hosts/ (domains only) + ips/
+  Phase 2b   Port scan         httpx multi-port (30+ ports) → hosts/alive.txt
   Phase 2c   Tech fingerprint  CMS/framework detection — passive (httpx) + active probes
   Phase 2.5  Takeover detect   candidates (non-2xx/3xx + dead) → dnsx CNAME · subjack · subzy · nuclei
   Phase 3    URL collection    gau · waybackurls · wayback-api · commoncrawl · katana · hakrawler · gospider
@@ -13,7 +15,6 @@ recon.py — Full recon pipeline  v1.3
                                GF-filtered : redirect xss sqli ssti rce lfi ssrf
                                Direct URLs : crlf csti rfi xxe  (no GF pattern → all_urls.txt)
   Phase 6    Cloud buckets     S3 · GCS · Azure — list/write/delete/objects
-
 Nuclei notes:
   • -dast is always passed — required for fuzzing-templates/ (fuzz-type templates)
   • Output: nuclei_<pattern>.txt (human) + nuclei_<pattern>.jsonl (structured)
@@ -60,18 +61,26 @@ DEFAULT_UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+# Ports probed by phase_port_scan (httpx multi-port sweep)
+HTTPX_PORTS = (
+    "80,81,161,443,2075,2076,2082,2083,2087,2379,"
+    "3000,3001,3306,3366,3868,4000,4044,4443,4848,"
+    "5000,5432,5601,5900,6000,6443,6885,7001,7002,"
+    "7077,8000,8069,8080,8081,8161,8181,8443,8500,"
+    "8888,8983,9000,9001,9090,9091,9200,9443,9999,"
+    "10000,10250,15672"
+)
+
 # GF pre-filtered: nuclei receives only URLs where GF found matching params
 GF_NUCLEI_MAP = {
-    "redirect":      NUCLEI_TEMPLATES_BASE / "redirect",
-    "xss":           NUCLEI_TEMPLATES_BASE / "xss",
-    "sqli":          NUCLEI_TEMPLATES_BASE / "sqli",
-    "ssti":          NUCLEI_TEMPLATES_BASE / "ssti",
-    "rce":           NUCLEI_TEMPLATES_BASE / "cmdi",       # cmdi dir = command injection / RCE
-    "lfi":           NUCLEI_TEMPLATES_BASE / "lfi",
-    "ssrf":          NUCLEI_TEMPLATES_BASE / "ssrf",
-    "csti":          NUCLEI_TEMPLATES_BASE / "csti",       # ~/.gf/csti.json
-    "rfi":           NUCLEI_TEMPLATES_BASE / "rfi",        # ~/.gf/rfi.json
-    "open-redirect": NUCLEI_TEMPLATES_BASE / "redirect",  # reuses redirect templates
+    "xss":      NUCLEI_TEMPLATES_BASE / "xss",
+    "redirect": NUCLEI_TEMPLATES_BASE / "redirect",
+    "sqli":     NUCLEI_TEMPLATES_BASE / "sqli",
+    "lfi":      NUCLEI_TEMPLATES_BASE / "lfi",
+    "rce":      NUCLEI_TEMPLATES_BASE / "cmdi",
+    "rfi":      NUCLEI_TEMPLATES_BASE / "rfi",
+    "csti":     NUCLEI_TEMPLATES_BASE / "csti",
+    "ssrf":     NUCLEI_TEMPLATES_BASE / "ssrf",
 }
 
 # No GF pattern available — run directly against all collected URLs
@@ -83,6 +92,9 @@ HOST_NUCLEI_MAP = {
 GF_PATTERNS   = list(GF_NUCLEI_MAP.keys())
 HOST_PATTERNS = list(HOST_NUCLEI_MAP.keys())
 ALL_PATTERNS  = GF_PATTERNS + HOST_PATTERNS
+
+# GF patterns collected for manual review only — no nuclei fuzzing step
+GF_ONLY_PATTERNS: list[str] = []
 
 # ─── CMS / Framework Fingerprinting ──────────────────────────────────────────
 
@@ -144,6 +156,40 @@ _CMS_PATTERNS: dict = {
     "GitLab":           ["gitlab"],
     "Jira":             ["jira", "atlassian jira"],
     "Confluence":       ["confluence"],
+    # ── Network / Firewall / Infra ───────────────────────────────────────────
+    "FortiGate":        ["fortigate", "fortinet fortigate"],
+    "FortiMail":        ["fortimail"],
+    "FortiClient EMS":  ["forticlient ems", "forticlientems"],
+    "Citrix NetScaler": ["netscaler", "citrix adc", "citrix gateway"],
+    "Cisco FMC":        ["firepower management center", "cisco fmc"],
+    "Cisco ASA":        ["cisco asa", "adaptive security appliance"],
+    "Checkpoint":       ["check point", "checkpoint firewall"],
+    "pfSense":          ["pfsense"],
+    "F5 BIG-IP":        ["big-ip", "f5 big-ip"],
+    "Palo Alto":        ["palo alto", "pan-os", "globalprotect"],
+    # ── AI / ML / Automation Platforms ───────────────────────────────────────
+    "Flowise":          ["flowise"],
+    "n8n":              ["n8n"],
+    "Langflow":         ["langflow"],
+    "Metabase":         ["metabase"],
+    "Gogs":             ["gogs"],
+    "Gitea":            ["gitea"],
+    # ── Databases, Middleware & DevOps ──────────────────────────────────────────
+    "ActiveMQ":         ["apache activemq", "activemq"],
+    "Elasticsearch":    ["elasticsearch"],
+    "Kibana":           ["kibana"],
+    "WebLogic":         ["oracle weblogic", "weblogic server"],
+    "GlassFish":        ["glassfish", "payara"],
+    "Jupyter":          ["jupyter notebook", "jupyterlab", "jupyter"],
+    "Prometheus":       ["prometheus"],
+    "Cockpit":          ["cockpit"],
+    "Apache Solr":      ["apache solr", "solr"],
+    "Consul":           ["consul"],
+    "Odoo":             ["odoo", "openobject"],
+    "Portainer":        ["portainer"],
+    "etcd":             ["etcd"],
+    "MinIO":            ["minio"],
+    "WHM":              ["whm", "web host manager"],
 }
 
 # ─── Active probe format ──────────────────────────────────────────────────────
@@ -386,6 +432,371 @@ _ACTIVE_PROBES: dict = {
          "cookie": "CMSCsrfCookie",
          "min_len": 0},
     ],
+
+    # ── Network / Firewall / Infra ────────────────────────────────────────────
+
+    "FortiGate": [
+        # FortiGate SSL-VPN login — unique JS variable fgt_lang only exists on FG
+        {"path": "/remote/login",
+         "body_re": r"fgt_lang|FortiGate|fortigate\.js",
+         "min_len": 200},
+        # Management UI — combo of title + cookie
+        {"path": "/login",
+         "body_re": r"FortiGate|<title[^>]*>FortiGate",
+         "min_len": 200},
+    ],
+
+    "FortiMail": [
+        {"path": "/admin/",
+         "body_re": r"FortiMail|fortimail|<title[^>]*>FortiMail",
+         "min_len": 200},
+        {"path": "/login",
+         "body_re": r"FortiMail|fortinet.*mail",
+         "min_len": 200},
+    ],
+
+    "FortiClient EMS": [
+        # /api/v1/system/version returns JSON with version info on EMS
+        {"path": "/api/v1/system/version",
+         "body_re": r'"version"\s*:\s*"\d+\.\d+|"product"\s*:\s*"FortiClient',
+         "resp_ct": "application/json",
+         "statuses": (200, 401),
+         "min_len": 10},
+    ],
+
+    "Citrix NetScaler": [
+        # NITRO API returns JSON error on unauth — unique to NetScaler
+        {"path": "/nitro/v1/config/nsversion",
+         "body_re": r'"errorcode"\s*:|"version"\s*:',
+         "statuses": (200, 401),
+         "min_len": 10},
+        # Gateway login page has nssbx or Citrix Gateway in title
+        {"path": "/vpn/index.html",
+         "body_re": r"NetScaler|Citrix\s+Gateway|nssbx\.js|CitrixAGBasic",
+         "min_len": 200},
+    ],
+
+    "Cisco FMC": [
+        # Platform info endpoint returns JSON — unauthenticated on older FMC
+        {"path": "/api/fmc_platform/v1/info/serverversion",
+         "body_re": r'"serverVersion"|"type"\s*:\s*"ServerVersion"',
+         "statuses": (200, 401),
+         "min_len": 10},
+        # Login page has Cisco Firepower in title
+        {"path": "/",
+         "body_re": r"Firepower Management Center|Cisco FMC|<title[^>]*>Firepower",
+         "min_len": 200},
+    ],
+
+    "Checkpoint": [
+        {"path": "/login",
+         "body_re": r"Check\s*Point|checkpoint|cpvpn|Check_Point",
+         "min_len": 200},
+        {"path": "/",
+         "body_re": r"Check\s*Point|<title[^>]*>Check Point",
+         "min_len": 200},
+    ],
+
+    "pfSense": [
+        {"path": "/",
+         "body_re": r"<title[^>]*>pfSense|pfSense\.org|pfsense",
+         "min_len": 200},
+        {"path": "/index.php",
+         "body_re": r"pfSense|csrf_magic|pfsense",
+         "min_len": 200},
+    ],
+
+    "F5 BIG-IP": [
+        # TMUI login is the definitive BIG-IP indicator
+        {"path": "/tmui/login.jsp",
+         "body_re": r"BIG-IP|F5\s+Networks|tmui|iControl",
+         "min_len": 200},
+        # X-WA-Info header is injected by BIG-IP ASM/WAF on some configs
+        {"path": "/",
+         "header": "X-WA-Info",
+         "min_len": 0},
+    ],
+
+    "Palo Alto": [
+        {"path": "/global-protect/login.esp",
+         "body_re": r"GlobalProtect|Palo\s*Alto|PAN-OS",
+         "min_len": 200},
+        {"path": "/php/login.php",
+         "body_re": r"Palo\s*Alto|pan_form|PAN-OS",
+         "min_len": 200},
+    ],
+
+    # ── AI / ML / Automation Platforms ────────────────────────────────────────
+
+    "Flowise": [
+        # Chatflows endpoint returns JSON array without auth (pre-auth versions)
+        {"path": "/api/v1/chatflows",
+         "body_re": r'"id"\s*:\s*"[0-9a-f-]{36}|"flowData"\s*:|^\s*\[',
+         "resp_ct": "application/json",
+         "statuses": (200, 401),
+         "min_len": 5},
+        {"path": "/",
+         "body_re": r"Flowise|flowise",
+         "min_len": 200},
+    ],
+
+    "n8n": [
+        # /rest/settings exposes versionCli — no auth on some deployments
+        {"path": "/rest/settings",
+         "body_re": r'"versionCli"\s*:|"n8nMetadata"\s*:',
+         "resp_ct": "application/json",
+         "statuses": (200, 401),
+         "min_len": 10},
+        {"path": "/",
+         "body_re": r"<title[^>]*>n8n|window\.n8nBaseUrl|n8n\.io",
+         "min_len": 100},
+    ],
+
+    "Langflow": [
+        # /health is always unauthenticated; /api/v1/flows requires auth
+        {"path": "/health",
+         "body_re": r'"status"\s*:\s*"ok"',
+         "resp_ct": "application/json",
+         "statuses": (200,),
+         "min_len": 5},
+        {"path": "/api/v1/flows",
+         "body_re": r'"id"\s*:\s*"[0-9a-f-]{36}|^\s*\[',
+         "resp_ct": "application/json",
+         "statuses": (200, 401),
+         "min_len": 5},
+    ],
+
+    "Metabase": [
+        # /api/session/properties leaks setup-token if not configured
+        {"path": "/api/session/properties",
+         "body_re": r'"setup-token"\s*:|"version"\s*:.*"tag"\s*:',
+         "resp_ct": "application/json",
+         "min_len": 10},
+    ],
+
+    "Gogs": [
+        {"path": "/api/v1/version",
+         "body_re": r'"version"\s*:\s*"',
+         "resp_ct": "application/json",
+         "min_len": 5},
+        {"path": "/",
+         "body_re": r"Gogs|<title[^>]*>Gogs|gogs\.io",
+         "min_len": 200},
+    ],
+
+    "Gitea": [
+        {"path": "/api/v1/version",
+         "body_re": r'"version"\s*:\s*"',
+         "resp_ct": "application/json",
+         "min_len": 5},
+        {"path": "/",
+         "body_re": r"Gitea|<title[^>]*>Gitea|gitea\.io",
+         "min_len": 200},
+    ],
+
+    # ── Databases, Middleware & DevOps ────────────────────────────────────────
+
+    "ActiveMQ": [
+        # Jolokia REST bridge bundled with ActiveMQ — unique MBean path
+        {"path": "/api/jolokia/read/org.apache.activemq:type=Broker,brokerName=localhost/BrokerName",
+         "body_re": r'"value"\s*:\s*"[^"]+"|"status"\s*:\s*200',
+         "resp_ct": "application/json",
+         "statuses": (200,),
+         "min_len": 10},
+        # Web admin console
+        {"path": "/admin/",
+         "body_re": r"ActiveMQ|activemq",
+         "min_len": 100},
+    ],
+
+    "Elasticsearch": [
+        # Root returns cluster info + unique tagline
+        {"path": "/",
+         "body_re": r'"cluster_name"\s*:|"tagline"\s*:\s*"You Know, for Search"',
+         "resp_ct": "application/json",
+         "statuses": (200, 401),
+         "min_len": 20},
+        # Cluster health endpoint — present even on unpatched deploys
+        {"path": "/_cluster/health",
+         "body_re": r'"cluster_name"\s*:|"status"\s*:\s*"(?:green|yellow|red)"',
+         "resp_ct": "application/json",
+         "statuses": (200, 401),
+         "min_len": 20},
+    ],
+
+    "Kibana": [
+        # Status API — always unauthenticated by design
+        {"path": "/api/status",
+         "body_re": r'"name"\s*:\s*"kibana"|"version"\s*:.*"number"',
+         "resp_ct": "application/json",
+         "statuses": (200, 401),
+         "min_len": 20},
+        {"path": "/",
+         "body_re": r"<title[^>]*>Kibana|kbn-injected-metadata|loadKibanaScreen",
+         "min_len": 100},
+    ],
+
+    "WebLogic": [
+        # Admin console login JSP — unique path to WebLogic
+        {"path": "/console/login/LoginForm.jsp",
+         "body_re": r"WebLogic\s+Server\s+Administration\s+Console|weblogic\.jar",
+         "min_len": 200},
+        # /console redirects to login JSP; body on 302 may still contain vendor strings
+        {"path": "/console/",
+         "body_re": r"Oracle\s+WebLogic|WebLogic\s+Administration",
+         "statuses": (200, 302, 403),
+         "min_len": 50},
+    ],
+
+    "GlassFish": [
+        {"path": "/common/index.jsf",
+         "body_re": r"GlassFish\s+Server|Payara\s+Server|glassfish",
+         "statuses": (200, 302),
+         "min_len": 100},
+        # X-Powered-By header set by GlassFish/Payara on every response
+        {"path": "/",
+         "header": "X-Powered-By",
+         "header_val": "GlassFish",
+         "min_len": 0},
+        {"path": "/",
+         "header": "X-Powered-By",
+         "header_val": "Payara",
+         "min_len": 0},
+    ],
+
+    "Jupyter": [
+        # Older/misconfigured deployments expose kernel list without auth
+        {"path": "/api/kernels",
+         "body_re": r'^\s*\[',
+         "resp_ct": "application/json",
+         "statuses": (200,),
+         "min_len": 2},
+        # Jupyter Server API version endpoint
+        {"path": "/api/",
+         "body_re": r'"version"\s*:\s*"\d+\.\d+',
+         "resp_ct": "application/json",
+         "statuses": (200,),
+         "min_len": 10},
+        {"path": "/",
+         "body_re": r"<title[^>]*>Jupyter|jupyter-notebook|jupyter-lab|JupyterLab",
+         "min_len": 100},
+    ],
+
+    "Prometheus": [
+        # Health check — unique response string
+        {"path": "/-/healthy",
+         "body_re": r"Prometheus(?:\s+Server)?\s+is\s+Healthy",
+         "statuses": (200,),
+         "min_len": 5},
+        # Config status API
+        {"path": "/api/v1/status/config",
+         "body_re": r'"status"\s*:\s*"success"',
+         "resp_ct": "application/json",
+         "statuses": (200,),
+         "min_len": 10},
+        {"path": "/",
+         "body_re": r"<title[^>]*>Prometheus|prometheus_build_info|/static/vendor\.bundle\.js",
+         "min_len": 100},
+    ],
+
+    "Apache Solr": [
+        # System info JSON — version fields unique to Solr
+        {"path": "/solr/admin/info/system?wt=json",
+         "body_re": r'"solr-spec-version"\s*:|"lucene-spec-version"\s*:',
+         "resp_ct": "application/json",
+         "statuses": (200, 401),
+         "min_len": 20},
+        # Admin UI
+        {"path": "/solr/",
+         "body_re": r"<title[^>]*>Solr\s+Admin|Apache\s+Solr",
+         "min_len": 100},
+    ],
+
+    "Consul": [
+        # Raft leader endpoint returns a plain JSON string with IP:port
+        {"path": "/v1/status/leader",
+         "body_re": r'"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+"',
+         "resp_ct": "application/json",
+         "statuses": (200,),
+         "min_len": 5},
+        # Service catalog always includes the built-in "consul" service entry
+        {"path": "/v1/catalog/services",
+         "body_re": r'"consul"\s*:\s*\[',
+         "resp_ct": "application/json",
+         "statuses": (200,),
+         "min_len": 10},
+        {"path": "/ui/",
+         "body_re": r"<title[^>]*>Consul|consul-ui|window\.__CONSUL",
+         "min_len": 100},
+    ],
+
+    "Odoo": [
+        {"path": "/web/database/manager",
+         "body_re": r"Odoo|OpenERP|<title[^>]*>Database\s+Manager",
+         "min_len": 100},
+        {"path": "/web/login",
+         "body_re": r"Odoo|odoo\.com|<title[^>]*>Odoo",
+         "min_len": 100},
+    ],
+
+    "Portainer": [
+        # /api/status always unauthenticated — returns version + auth mode
+        {"path": "/api/status",
+         "body_re": r'"Version"\s*:\s*"[^"]+"|"Authentication"\s*:\s*(?:true|false)',
+         "resp_ct": "application/json",
+         "statuses": (200,),
+         "min_len": 10},
+        {"path": "/",
+         "body_re": r"<title[^>]*>Portainer|portainer\.io|ng-app.*portainer",
+         "min_len": 100},
+    ],
+
+    "etcd": [
+        # /version always unauthenticated — exposes server + cluster version
+        {"path": "/version",
+         "body_re": r'"etcdserver"\s*:\s*"\d+\.\d+|"etcdcluster"\s*:\s*"',
+         "resp_ct": "application/json",
+         "statuses": (200,),
+         "min_len": 10},
+        {"path": "/health",
+         "body_re": r'"health"\s*:\s*"true"',
+         "resp_ct": "application/json",
+         "statuses": (200,),
+         "min_len": 5},
+    ],
+
+    "Cockpit": [
+        {"path": "/cockpit/login",
+         "body_re": r"<title[^>]*>Cockpit|cockpit\.js|cockpit-components",
+         "min_len": 100},
+        {"path": "/",
+         "body_re": r"<title[^>]*>Cockpit|cockpit\.js",
+         "min_len": 100},
+    ],
+
+    "MinIO": [
+        # Console login page — default on port 9001
+        {"path": "/login",
+         "body_re": r"<title[^>]*>MinIO|minio-ui|__MINIO_BROWSER|MinIO\s+Console",
+         "min_len": 100},
+        {"path": "/",
+         "body_re": r"<title[^>]*>MinIO|MinIO\s+Browser|minio-ui",
+         "min_len": 100},
+    ],
+
+    "cPanel": [
+        {"path": "/",
+         "body_re": r"<title[^>]*>cPanel|cPanel.*Log\s+In|cpsess",
+         "statuses": (200, 302),
+         "min_len": 100},
+    ],
+
+    "WHM": [
+        {"path": "/",
+         "body_re": r"<title[^>]*>WHM|WebHost\s+Manager|Web\s+Host\s+Manager",
+         "statuses": (200, 302),
+         "min_len": 100},
+    ],
 }
 
 # CMS that carry significant CVE surface — highlighted in output
@@ -394,6 +805,15 @@ _SECURITY_CMS = {
     "PrestaShop", "OpenCart", "TYPO3", "Ghost", "VTEX", "Moodle",
     "AEM", "Sitecore", "Strapi", "Kentico", "Umbraco", "Craft CMS",
     "Salesforce CC", "SAP Hybris",
+    # Network / Firewall / Infra
+    "FortiGate", "FortiMail", "FortiClient EMS", "Citrix NetScaler",
+    "Cisco FMC", "Cisco ASA", "Checkpoint", "pfSense", "F5 BIG-IP", "Palo Alto",
+    # AI / ML / Automation (high CVE surface in 2025-2026)
+    "Flowise", "n8n", "Langflow", "Metabase", "Gogs", "Gitea",
+    # Databases, Middleware & DevOps
+    "ActiveMQ", "Elasticsearch", "Kibana", "WebLogic", "GlassFish",
+    "Jupyter", "Prometheus", "Cockpit", "Apache Solr", "Consul", "Odoo",
+    "Portainer", "etcd", "MinIO", "cPanel", "WHM",
 }
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
@@ -537,6 +957,24 @@ def count_lines(p) -> int:
 def write_lines(dest: Path, lines):
     dest.write_text("\n".join(sorted(set(ln.strip() for ln in lines if ln.strip()))) + "\n")
 
+def _url_in_scope(url: str, domain: str) -> bool:
+    """True if the URL's hostname is exactly domain or a subdomain of domain."""
+    try:
+        host = urlparse(url).netloc.split(":")[0].strip().lower()
+        return host == domain or host.endswith(f".{domain}")
+    except Exception:
+        return False
+
+def _filter_urls_to_scope(urls_file: Path, domain: str) -> tuple:
+    """Rewrite urls_file keeping only in-scope URLs. Returns (kept, total)."""
+    if not urls_file.exists():
+        return 0, 0
+    lines = [l.strip() for l in urls_file.read_text(errors="replace").splitlines() if l.strip()]
+    total = len(lines)
+    kept  = [u for u in lines if _url_in_scope(u, domain)]
+    urls_file.write_text("\n".join(kept) + ("\n" if kept else ""))
+    return len(kept), total
+
 # ─── Phase 1 · Subdomain Enumeration ─────────────────────────────────────────
 
 def _enum_crtsh(domain: str, outdir: Path, proxies=None):
@@ -545,22 +983,97 @@ def _enum_crtsh(domain: str, outdir: Path, proxies=None):
         warn("  crt.sh skipped (pip install requests)")
         return
     info("  crt.sh ...")
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                f"https://crt.sh/?q=%.{domain}&output=json",
+                timeout=45, proxies=proxies, headers={"User-Agent": "recon.py"}
+            )
+            if r.status_code >= 500:
+                last_err = f"HTTP {r.status_code}"
+                import time; time.sleep(5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            subs = set()
+            for entry in r.json():
+                for name in entry.get("name_value", "").split("\n"):
+                    name = name.strip().lstrip("*.").lower()
+                    if name.endswith(f".{domain}") or name == domain:
+                        subs.add(name)
+            write_lines(out, subs)
+            ok(f"  crt.sh: {len(subs)}")
+            return
+        except Exception as e:
+            last_err = str(e)
+            import time; time.sleep(5 * (attempt + 1))
+    warn(f"  crt.sh failed after 3 attempts: {last_err} — trying certspotter fallback")
+    # certspotter fallback when crt.sh is unavailable
+    _enum_certspotter(domain, outdir, proxies, _label="crt.sh→certspotter")
+
+def _enum_certspotter(domain: str, outdir: Path, proxies=None, _label="certspotter"):
+    out = outdir / "raw_certspotter.txt"
+    if not HAS_REQUESTS:
+        return
+    info(f"  {_label} ...")
     try:
         r = requests.get(
-            f"https://crt.sh/?q=%.{domain}&output=json",
-            timeout=30, proxies=proxies, headers={"User-Agent": "recon.py"}
+            f"https://api.certspotter.com/v1/issuances"
+            f"?domain={domain}&include_subdomains=true&expand=dns_names",
+            timeout=(10, 30), proxies=proxies, headers={"User-Agent": "recon.py"},
         )
+        if r.status_code == 429:
+            warn(f"  {_label}: rate limited (100 req/hr without token)")
+            return
         r.raise_for_status()
         subs = set()
         for entry in r.json():
-            for name in entry.get("name_value", "").split("\n"):
+            for name in entry.get("dns_names", []):
                 name = name.strip().lstrip("*.").lower()
                 if name.endswith(f".{domain}") or name == domain:
                     subs.add(name)
-        write_lines(out, subs)
-        ok(f"  crt.sh: {len(subs)}")
+        if subs:
+            # merge into existing file if it exists (from crt.sh fallback path)
+            existing = set()
+            if out.exists():
+                existing = set(out.read_text().splitlines())
+            write_lines(out, subs | existing)
+            ok(f"  {_label}: {len(subs)}")
+        else:
+            warn(f"  {_label}: no results")
     except Exception as e:
-        warn(f"  crt.sh failed: {e}")
+        warn(f"  {_label} failed: {e}")
+
+
+def _enum_hackertarget(domain: str, outdir: Path, proxies=None):
+    out = outdir / "raw_hackertarget.txt"
+    if not HAS_REQUESTS:
+        warn("  hackertarget skipped (pip install requests)")
+        return
+    info("  hackertarget ...")
+    try:
+        r = requests.get(
+            f"https://api.hackertarget.com/hostsearch/?q={domain}",
+            timeout=(10, 30), proxies=proxies, headers={"User-Agent": "recon.py"},
+        )
+        r.raise_for_status()
+        if "error" in r.text.lower()[:50]:
+            warn(f"  hackertarget: {r.text.strip()[:80]}")
+            return
+        subs = set()
+        for line in r.text.splitlines():
+            if "," in line:
+                hostname = line.split(",")[0].strip().lower()
+                if hostname.endswith(f".{domain}") or hostname == domain:
+                    subs.add(hostname)
+        if subs:
+            write_lines(out, subs)
+            ok(f"  hackertarget: {len(subs)}")
+        else:
+            warn("  hackertarget: no results")
+    except Exception as e:
+        warn(f"  hackertarget failed: {e}")
+
 
 def _enum_chaos(domain: str, outdir: Path, key=None):
     out = outdir / "raw_chaos.txt"
@@ -655,12 +1168,146 @@ def _enum_findomain(domain: str, outdir: Path):
     info("  findomain ...")
     rc, stdout, _ = run(
         ["findomain", "-t", domain, "-u", str(out), "--quiet"],
-        timeout=180,
+        timeout=90,
     )
     if out.exists() and out.stat().st_size > 0:
         ok(f"  findomain: {count_lines(out)}")
     else:
         warn("  findomain: no results")
+
+def _enum_shodanx(domain: str, outdir: Path):
+    out = outdir / "raw_shodanx.txt"
+    if not which("shodanx"):
+        warn("  shodanx not found")
+        return
+    info("  shodanx ...")
+    rc, stdout, stderr = run(
+        ["shodanx", "subdomain", "-d", domain, "-o", str(out)],
+        timeout=120,
+    )
+    if out.exists() and out.stat().st_size > 0:
+        ok(f"  shodanx: {count_lines(out)}")
+    else:
+        warn("  shodanx: no results")
+
+
+def _enum_subcat(domain: str, outdir: Path):
+    out = outdir / "raw_subcat.txt"
+    subcat_path = Path("/home/guilherme/kali/subcat/subcat/subcat.py")
+    if not subcat_path.exists():
+        warn("  subcat not found  (expected /home/guilherme/kali/subcat/subcat.py)")
+        return
+    info("  subcat ...")
+    rc, stdout, stderr = run(
+        ["python3", str(subcat_path), "-d", domain, "-o", str(out)],
+        timeout=180,
+    )
+    if out.exists() and out.stat().st_size > 0:
+        ok(f"  subcat: {count_lines(out)}")
+    else:
+        warn("  subcat: no results")
+
+
+def _enum_alienvault(domain: str, outdir: Path, proxies=None):
+    out = outdir / "raw_alienvault.txt"
+    if not HAS_REQUESTS:
+        warn("  alienvault skipped (pip install requests)")
+        return
+    info("  alienvault OTX ...")
+    import time as _time
+    last_err = None
+    for attempt in range(2):
+        try:
+            r = requests.get(
+                f"https://otx.alienvault.com/api/v1/indicators/hostname/{domain}/passive_dns",
+                timeout=(10, 30), proxies=proxies, headers={"User-Agent": "recon.py"},
+            )
+            r.raise_for_status()
+            subs = set()
+            for entry in r.json().get("passive_dns", []):
+                hostname = entry.get("hostname", "").strip().lower()
+                if hostname.endswith(f".{domain}") or hostname == domain:
+                    subs.add(hostname)
+            if subs:
+                write_lines(out, subs)
+                ok(f"  alienvault: {len(subs)}")
+            else:
+                warn("  alienvault: no results")
+            return
+        except Exception as e:
+            last_err = str(e)
+            _time.sleep(3)
+    warn(f"  alienvault failed: {last_err}")
+
+
+def _enum_webarchive_subs(domain: str, outdir: Path, proxies=None):
+    out = outdir / "raw_webarchive_subs.txt"
+    if not HAS_REQUESTS:
+        warn("  webarchive subs skipped (pip install requests)")
+        return
+    info("  webarchive (subdomains) ...")
+    try:
+        r = requests.get(
+            f"http://web.archive.org/cdx/search/cdx"
+            f"?url=*.{domain}/*&output=json&collapse=urlkey",
+            timeout=(30, 120), proxies=proxies, headers={"User-Agent": "recon.py"},
+        )
+        r.raise_for_status()
+        subs = set()
+        for row in r.json()[1:]:
+            if row and len(row) > 2:
+                try:
+                    host = urlparse(row[2]).netloc.split(":")[0].lower()
+                    if host and (host.endswith(f".{domain}") or host == domain):
+                        subs.add(host)
+                except Exception:
+                    pass
+        if subs:
+            write_lines(out, subs)
+            ok(f"  webarchive: {len(subs)}")
+        else:
+            warn("  webarchive: no results")
+    except Exception as e:
+        warn(f"  webarchive subs failed: {e}")
+
+
+def _enum_urlscan(domain: str, outdir: Path, proxies=None):
+    out = outdir / "raw_urlscan.txt"
+    if not HAS_REQUESTS:
+        warn("  urlscan skipped (pip install requests)")
+        return
+    info("  urlscan.io ...")
+    try:
+        r = requests.get(
+            f"https://urlscan.io/api/v1/search/?q=page.domain:{domain}&size=10000",
+            timeout=(10, 30), proxies=proxies, headers={"User-Agent": "recon.py"},
+        )
+        if r.status_code == 429:
+            warn("  urlscan: rate limited (no API key)")
+            return
+        r.raise_for_status()
+        subs = set()
+        for result in r.json().get("results", []):
+            d = result.get("page", {}).get("domain", "").lower()
+            if d and (d.endswith(f".{domain}") or d == domain):
+                subs.add(d)
+            # also extract host from full URL
+            url = result.get("page", {}).get("url", "")
+            if url:
+                try:
+                    h = urlparse(url).netloc.split(":")[0].lower()
+                    if h and (h.endswith(f".{domain}") or h == domain):
+                        subs.add(h)
+                except Exception:
+                    pass
+        if subs:
+            write_lines(out, subs)
+            ok(f"  urlscan: {len(subs)}")
+        else:
+            warn("  urlscan: no results")
+    except Exception as e:
+        warn(f"  urlscan failed: {e}")
+
 
 def phase_enum(domain: str, base: Path, args, proxies=None) -> Path:
     phase_header(1, "Subdomain Enumeration")
@@ -675,15 +1322,27 @@ def phase_enum(domain: str, base: Path, args, proxies=None) -> Path:
         (_enum_subfinder,          (domain, outdir),                    {}),
         (_enum_amass,              (domain, outdir),                    {}),
         (_enum_findomain,          (domain, outdir),                    {}),
+        (_enum_shodanx,            (domain, outdir),                    {}),
+        (_enum_subcat,             (domain, outdir),                    {}),
+        (_enum_alienvault,         (domain, outdir, proxies),           {}),
+        (_enum_webarchive_subs,    (domain, outdir, proxies),           {}),
+        (_enum_urlscan,            (domain, outdir, proxies),           {}),
+        (_enum_certspotter,        (domain, outdir, proxies),           {}),
+        (_enum_hackertarget,       (domain, outdir, proxies),           {}),
     ]
 
-    with ThreadPoolExecutor(max_workers=7) as ex:
-        futures = [ex.submit(fn, *a, **kw) for fn, a, kw in fns]
-        for f in as_completed(futures):
-            try:
-                f.result()
-            except Exception as e:
-                warn(f"  enum error: {e}")
+    with ThreadPoolExecutor(max_workers=14) as ex:
+        futures = {ex.submit(fn, *a, **kw): fn.__name__ for fn, a, kw in fns}
+        try:
+            for f in as_completed(futures, timeout=660):
+                try:
+                    f.result()
+                except Exception as e:
+                    warn(f"  enum error: {e}")
+        except Exception:
+            stragglers = [name for fut, name in futures.items() if not fut.done()]
+            if stragglers:
+                warn(f"  enum timeout — skipping: {', '.join(stragglers)}")
 
     merged = outdir / "all_subdomains.txt"
     n = merge_files(list(outdir.glob("raw_*.txt")), merged)
@@ -784,7 +1443,11 @@ def phase_extract(httpx_jsonl: Path, base: Path):
                 netloc = parsed.netloc or ""
                 bare = netloc.split(":")[0]
                 if bare:
-                    hosts.add(bare.lower())
+                    try:
+                        ipaddress.ip_address(bare)
+                        ips.add(bare)
+                    except ValueError:
+                        hosts.add(bare.lower())
             for ip in entry.get("a", []) + entry.get("aaaa", []):
                 try:
                     ipaddress.ip_address(ip)
@@ -807,6 +1470,53 @@ def phase_extract(httpx_jsonl: Path, base: Path):
 
     ok(f"Unique hosts (no scheme): {bold(str(len(hosts)))}  →  {hosts_file}")
     ok(f"Unique IPs:               {bold(str(len(ips)))}  →  {ips_file}")
+
+# ─── Phase 2b · Multi-Port HTTP/S Scan ───────────────────────────────────────
+
+def phase_port_scan(hosts_file: Path, base: Path) -> Path:
+    """
+    Phase 2b — Multi-port httpx sweep against bare hostnames.
+    Input : hosts/live_hosts.txt   (domains only, no IPs, no scheme)
+    Output: hosts/alive.txt        (full URLs that responded on any port)
+    """
+    phase_header("2b", "Multi-Port HTTP/S Scan (httpx)")
+    hosts_dir = base / "hosts"
+    hosts_dir.mkdir(parents=True, exist_ok=True)
+
+    alive_txt = hosts_dir / "alive.txt"
+
+    if not which("httpx"):
+        err("httpx not found — skipping port scan")
+        return alive_txt
+
+    n_input = count_lines(hosts_file)
+    if n_input == 0:
+        warn("No hosts for port scan")
+        return alive_txt
+
+    port_count = len(HTTPX_PORTS.split(","))
+    info(f"Scanning {n_input} hosts across {port_count} ports ...")
+
+    rc, stdout, stderr = run(
+        [
+            "httpx",
+            "-l",       str(hosts_file),
+            "-ports",   HTTPX_PORTS,
+            "-threads", "80",
+            "-silent",
+            "-o",       str(alive_txt),
+        ],
+        timeout=1800,
+    )
+
+    n_alive = count_lines(alive_txt) if alive_txt.exists() else 0
+    if n_alive:
+        ok(f"Alive (multi-port): {bold(str(n_alive))}  →  {alive_txt}")
+    else:
+        warn("No alive hosts found on extended ports")
+
+    return alive_txt
+
 
 # ─── Phase 2c · Technology Fingerprinting ────────────────────────────────────
 
@@ -1108,7 +1818,9 @@ def _collect_katana(live_urls_file: Path, outdir: Path, proxy_env=None):
     info(f"  katana → {count_lines(live_urls_file)} live hosts ...")
     rc, stdout, _ = run(
         ["katana", "-list", str(live_urls_file), "-silent",
-         "-d", "3", "-jc", "-kf", "all", "-o", str(out)],
+         "-d", "3", "-kf", "all",
+         "-c", "5", "-p", "5", "-rl", "150", "-timeout", "10",
+         "-o", str(out)],
         env_extra=proxy_env, timeout=600,
     )
     if out.exists() and out.stat().st_size > 0:
@@ -1148,8 +1860,8 @@ def _collect_gospider(live_urls_file: Path, outdir: Path, proxy_env=None):
         return
     info(f"  gospider → {count_lines(live_urls_file)} live hosts ...")
     rc, stdout, _ = run(
-        ["gospider", "-S", str(live_urls_file), "-c", "10", "-d", "3",
-         "--other-source", "--include-subs"],
+        ["gospider", "-S", str(live_urls_file), "-c", "5", "-d", "3",
+         "-t", "3", "--include-subs"],
         env_extra=proxy_env, timeout=600,
     )
     if rc == 0 and stdout.strip():
@@ -1231,7 +1943,7 @@ def phase_urls(domain: str, live_urls_file, base: Path, args, proxies=None, prox
             try: f.result()
             except Exception as e: warn(f"  url collector error: {e}")
 
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    with ThreadPoolExecutor(max_workers=1) as ex:
         futures = [ex.submit(fn, *a, **kw) for fn, a, kw in active]
         for f in as_completed(futures):
             try: f.result()
@@ -1239,23 +1951,53 @@ def phase_urls(domain: str, live_urls_file, base: Path, args, proxies=None, prox
 
     merged = outdir / "all_urls.txt"
     n = merge_files(list(outdir.glob("raw_*.txt")), merged)
-    ok(f"Total unique URLs: {bold(str(n))}")
+    kept, _ = _filter_urls_to_scope(merged, domain)
+    dropped = n - kept
+    msg = f"Total unique URLs: {bold(str(n))} raw → {bold(str(kept))} in-scope"
+    if dropped:
+        msg += f"  ({dropped} out-of-scope removed)"
+    ok(msg)
     return merged
 
 # ─── Phase 4 · GF Pattern Matching ───────────────────────────────────────────
 
+def _gf_pattern_exists(pattern: str) -> bool:
+    return (Path.home() / ".gf" / f"{pattern}.json").exists()
+
 def _run_gf_pattern(pattern: str, urls_file: Path, outdir: Path) -> int:
+    if not _gf_pattern_exists(pattern):
+        warn(f"  gf {pattern:<14}: skipped (no ~/.gf/{pattern}.json)")
+        return 0
     out = outdir / f"gf_{pattern}.txt"
-    stdin_data = Path(urls_file).read_text(errors="replace") if Path(urls_file).exists() else ""
-    rc, stdout, _ = run(["gf", pattern], stdin_data=stdin_data, timeout=120)
-    if rc == 0 and stdout.strip():
-        lines = sorted(set(l.strip() for l in stdout.splitlines() if l.strip()))
-        out.write_text("\n".join(lines) + "\n")
-        ok(f"  gf {pattern:<10}: {len(lines)}")
-        return len(lines)
-    else:
+    if not Path(urls_file).exists():
         out.write_text("")
-        info(f"  gf {pattern:<10}: 0")
+        return 0
+    try:
+        # Stream file via OS pipe — never loads into Python heap.
+        # Each thread opens its own fd; concurrent reads are safe (read-only).
+        with open(urls_file, "r", errors="replace") as fh:
+            proc = subprocess.run(
+                ["gf", pattern],
+                stdin=fh,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        if proc.returncode == 0 and proc.stdout.strip():
+            lines = sorted(set(l.strip() for l in proc.stdout.splitlines() if l.strip()))
+            out.write_text("\n".join(lines) + "\n")
+            ok(f"  gf {pattern:<14}: {len(lines)}")
+            return len(lines)
+        else:
+            out.write_text("")
+            info(f"  gf {pattern:<14}: 0")
+            return 0
+    except subprocess.TimeoutExpired:
+        warn(f"  gf {pattern:<14}: timeout")
+        out.write_text("")
+        return 0
+    except Exception as e:
+        warn(f"  gf {pattern:<14}: error — {e}")
         return 0
 
 def phase_gf(urls_file: Path, base: Path) -> Path:
@@ -1272,14 +2014,45 @@ def phase_gf(urls_file: Path, base: Path) -> Path:
         warn("No URLs to pattern-match")
         return outdir
 
-    info(f"Scanning {n} URLs with {len(GF_PATTERNS)} GF patterns...")
+    nuclei_pats  = [p for p in GF_PATTERNS      if _gf_pattern_exists(p)]
+    infoonly_pats = [p for p in GF_ONLY_PATTERNS if _gf_pattern_exists(p)]
+    all_pats      = nuclei_pats + infoonly_pats
 
-    with ThreadPoolExecutor(max_workers=len(GF_PATTERNS)) as ex:
+    if not all_pats:
+        warn("No GF patterns installed — skipping")
+        return outdir
+
+    # Cap parallelism by URL volume: each worker reads the file via OS pipe,
+    # but regex matching still burns CPU. At 100k+ URLs one gf call already
+    # saturates a core, so extra workers just fight for the same CPUs.
+    if n > 100_000:
+        workers = 4
+    elif n > 10_000:
+        workers = 8
+    else:
+        workers = min(len(all_pats), 16)
+
+    info(f"Scanning {n} URLs — {len(nuclei_pats)} → nuclei, {len(infoonly_pats)} informational  (workers={workers})")
+
+    missing_nuclei = [p for p in GF_PATTERNS if not _gf_pattern_exists(p)]
+    if missing_nuclei:
+        warn(f"  Missing nuclei patterns: {', '.join(missing_nuclei)}")
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(_run_gf_pattern, pat, urls_file, outdir): pat
-                   for pat in GF_PATTERNS}
+                   for pat in all_pats}
         for f in as_completed(futures):
             try: f.result()
             except Exception as e: warn(f"  gf error: {e}")
+
+    hits = [(p, count_lines(outdir / f"gf_{p}.txt")) for p in all_pats]
+    hits = sorted([(p, c) for p, c in hits if c > 0], key=lambda x: -x[1])
+    if hits:
+        print()
+        info("GF hits summary:")
+        for pat, cnt in hits:
+            tag = "" if pat in nuclei_pats else "  [info]"
+            print(f"    {str(cnt).rjust(5)}  {pat}{tag}")
 
     return outdir
 
@@ -1378,29 +2151,68 @@ def phase_bruteforce(domain: str, base: Path, wordlist: Path) -> Path:
 # ─── Phase 6 · Cloud Bucket Discovery ────────────────────────────────────────
 
 BUCKET_SUFFIXES = [
+    # Web / assets
     "assets", "static", "media", "files", "uploads", "images", "img",
-    "backup", "backups", "dev", "prod", "staging", "stage", "test", "qa",
-    "logs", "data", "public", "cdn", "storage", "resources", "content",
-    "app", "web", "api", "private", "downloads", "archive", "docs",
-    "bucket", "s3", "gcs", "blob",
+    "cdn", "resources", "content", "public", "web", "site",
+    # App tiers
+    "app", "api", "frontend", "backend", "mobile",
+    "dev", "development", "prod", "production", "staging", "stage",
+    "test", "qa", "homolog", "hml", "sandbox", "uat",
+    # Storage / infra
+    "storage", "bucket", "s3", "gcs", "blob", "store",
+    "archive", "archives", "bak",
+    # Data / BI
+    "data", "database", "db", "datalake", "lake", "warehouse", "dwh",
+    "analytics", "reports", "export", "exports", "dump", "dumps",
+    "logs", "log", "audit", "monitoring",
+    # Backups
+    "backup", "backups", "restore", "snapshot", "snapshots",
+    # Docs / downloads
+    "docs", "documents", "downloads", "attachments", "invoices",
+    "notas", "nfe", "boletos", "contratos",
+    # Private / secrets
+    "private", "internal", "secrets", "config", "configs", "env",
+    "credentials", "certs", "certificates", "keys",
+    # Cloud-specific
+    "terraform", "infra", "infrastructure", "deploy", "deployments",
+    "builds", "artifacts", "releases", "packages",
+    # BR/PT variants
+    "arquivos", "imagens", "fotos", "videos", "relatorios",
+    "clientes", "usuarios", "pedidos", "vendas", "financeiro",
+    "fiscal", "contabil", "rh", "juridico",
+    # Common suffixes
+    "2023", "2024", "2025",
 ]
 
 AZURE_CONTAINERS = [
     "$web", "public", "assets", "media", "files", "images", "uploads",
     "static", "content", "data", "backup", "docs", "downloads", "private",
+    "web", "api", "app", "cdn", "storage", "archive", "logs",
+    "dev", "prod", "staging", "test", "qa",
+    "database", "db", "export", "dump", "reports",
+    "invoices", "notas", "contratos", "boletos",
 ]
 
 def _gen_bucket_names(domain: str) -> list:
     parts   = domain.split(".")
-    base    = parts[0]
-    dashed  = domain.replace(".", "-")
-    names   = set()
+    base    = parts[0]                   # sysmo
+    dashed  = domain.replace(".", "-")   # sysmo-com-br
+    tld_stripped = ".".join(parts[:-1]) if len(parts) > 2 else base  # sysmo.com
 
-    for stem in [base, dashed]:
+    names = set()
+
+    stems = [base, dashed]
+    # also try without common BR TLD noise: empresa.com.br → empresa + empresa-web
+    if len(parts) >= 3 and parts[-1] == "br":
+        stems.append(".".join(parts[:-2]))       # sysmo.com → sysmo-com
+        stems.append(parts[0])                   # already have base
+
+    for stem in stems:
         names.add(stem)
         for suf in BUCKET_SUFFIXES:
             names.add(f"{stem}-{suf}")
             names.add(f"{suf}-{stem}")
+            names.add(f"{stem}{suf}")   # sysmoweb, sysmobackup
 
     # Filter: S3/GCS bucket names — 3-63 chars, lowercase alphanumeric/hyphen/dot
     valid = set()
@@ -1412,18 +2224,68 @@ def _gen_bucket_names(domain: str) -> list:
 
 # Common sensitive object names — tried against any bucket even without listing
 COMMON_OBJECTS = [
-    "backup.zip", "backup.tar.gz", "backup.tar", "backup.sql",
-    "dump.sql", "database.sql", "db.sql", "db.tar.gz",
-    "users.csv", "users.json", "clients.csv", "clientes.csv",
-    "credentials.json", "credentials.txt", "creds.json",
+    # SQL dumps — generic
+    "backup.sql", "backup.sql.gz", "backup.zip", "backup.tar.gz", "backup.tar",
+    "dump.sql", "dump.sql.gz", "database.sql", "database.sql.gz",
+    "db.sql", "db.sql.gz", "db.tar.gz", "db_backup.sql",
+    "data.sql", "export.sql", "full_backup.sql",
+
+    # Cloud SQL export pattern (GCP — what we just found)
+    "cloudsql_export.sql", "cloud_sql_export.sql",
+
+    # Archives
+    "backup.tar.bz2", "site.zip", "www.zip", "htdocs.zip", "html.zip",
+    "source.zip", "code.zip", "app.zip",
+
+    # CSV/JSON data exports
+    "users.csv", "users.json", "clientes.csv", "clientes.json",
+    "clients.csv", "clients.json", "customers.csv", "customers.json",
+    "pedidos.csv", "pedidos.json", "vendas.csv", "vendas.json",
+    "export.csv", "export.json", "export.zip",
+    "relatorio.csv", "relatorio.xlsx", "data.csv", "data.json", "data.zip",
+    "emails.csv", "emails.txt", "cpfs.csv", "cpfs.txt",
+
+    # Config / secrets
+    ".env", ".env.production", ".env.prod", ".env.local", ".env.staging",
+    ".env.development", ".env.dev", ".env.example",
     "config.json", "config.yml", "config.yaml", "configuration.json",
-    ".env", ".env.production", ".env.prod", ".env.local",
-    "secrets.json", "keys.json", "key.json", "keys.txt",
-    "export.csv", "data.json", "data.zip",
-    "passwords.txt", "pass.txt", "password.txt",
+    "settings.json", "settings.py", "local_settings.py",
+    "secrets.json", "secrets.yml", "secrets.yaml",
+    "keys.json", "key.json", "keys.txt", "api_keys.txt",
+    "credentials.json", "credentials.txt", "creds.json", "creds.txt",
+    "service-account.json", "service_account.json", "sa.json",
+    "gcp-credentials.json", "firebase-adminsdk.json",
+
+    # Passwords
+    "passwords.txt", "pass.txt", "password.txt", "senhas.txt",
+
+    # SSH / TLS
     "private.pem", "private.key", "id_rsa", "id_rsa.pub",
+    "server.key", "server.pem", "cert.pem", "ca.pem",
+
+    # Cloud infra
     "aws_credentials", ".aws/credentials",
-    "terraform.tfstate", "terraform.tfvars",
+    "terraform.tfstate", "terraform.tfstate.backup", "terraform.tfvars",
+    ".terraform/terraform.tfstate",
+
+    # Docker / CI
+    "docker-compose.yml", "docker-compose.yaml",
+    ".github/workflows/deploy.yml",
+    "Dockerfile", ".dockerenv",
+
+    # App config leaks
+    "wp-config.php", "wp-config.php.bak",
+    "application.properties", "application.yml",
+    "appsettings.json", "web.config",
+    "database.yml", "database.json",
+
+    # NF-e / fiscal BR
+    "nfe.xml", "nfe.zip", "notas.zip", "notas.xml",
+    "danfe.pdf", "boleto.pdf",
+
+    # Log files
+    "access.log", "error.log", "app.log", "debug.log",
+    "logs.zip", "logs.tar.gz",
 ]
 
 def _probe_objects(base_url: str, session) -> list:
@@ -2300,7 +3162,8 @@ def print_summary(base: Path):
     layout = [
         ("subdomains/all_subdomains.txt",   "All unique subdomains"),
         ("httpx/httpx_live.txt",            "Live hosts (full URL)"),
-        ("hosts/live_hosts.txt",            "Live hostnames — no scheme"),
+        ("hosts/live_hosts.txt",            "Live hostnames — domains only, no scheme"),
+        ("hosts/alive.txt",                 "Alive hosts — multi-port scan"),
         ("ips/unique_ips.txt",              "Unique resolved IPs"),
         ("urls/all_urls.txt",               "All collected URLs"),
     ]
@@ -2446,6 +3309,8 @@ examples:
     g4.add_argument("--skip-gf",            action="store_true", help="Skip GF pattern matching")
     g4.add_argument("--skip-nuclei",        action="store_true", help="Skip nuclei scanning")
     g4.add_argument("--skip-buckets",       action="store_true", help="Skip cloud bucket discovery")
+    g4.add_argument("--buckets-only",       action="store_true",
+                    help="Run only the bucket discovery phase — skip all other phases")
 
     # Nuclei options
     g5 = p.add_argument_group("nuclei")
@@ -2496,6 +3361,12 @@ def main():
     info(f"Target : {bold(args.domain)}")
     info(f"Output : {bold(str(base))}")
 
+    # ── Buckets-only shortcut ─────────────────────────────────────────────────
+    if args.buckets_only:
+        info("Mode: --buckets-only  (all other phases skipped)")
+        phase_buckets(args.domain, base, proxies=proxies if args.tor else None)
+        sys.exit(0)
+
     # ── Phase 1 · Subdomain Enumeration ──────────────────────────────────────
     if args.subdomains_file:
         subdomains_file = Path(args.subdomains_file)
@@ -2526,6 +3397,9 @@ def main():
         httpx_jsonl, live_urls_file = phase_httpx(subdomains_file, base)
         if httpx_jsonl:
             phase_extract(httpx_jsonl, base)
+            hosts_file = base / "hosts" / "live_hosts.txt"
+            if hosts_file.exists() and count_lines(hosts_file) > 0:
+                phase_port_scan(hosts_file, base)
 
     # ── Phase 2c · Technology Fingerprinting ─────────────────────────────────
     if not args.skip_fingerprint:
